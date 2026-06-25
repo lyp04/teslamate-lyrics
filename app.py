@@ -81,6 +81,7 @@ _access = {"token": None, "exp": 0}
 _tm_access = {"token": None, "ts": 0.0}
 _vin_cache = {"vin": FORCED_VIN or None}
 _lyrics_cache = {}  # (key, source) -> list[[t,text]]
+_candidate_usable_cache = {}  # candidate id -> bool, avoids re-checking source-picker rows
 # Short-TTL cache for /api/state so bursts (scheduled poll + visibilitychange,
 # extra tabs, retries) collapse into one Fleet API vehicle_data hit. The browser
 # already advances lyrics locally, so a couple seconds of staleness is invisible.
@@ -1302,6 +1303,31 @@ def translate_lines(texts, tl="zh-CN"):
     return out
 
 
+def candidate_has_usable_lyrics(candidate):
+    """Return True only when a source-picker candidate can actually serve lyrics.
+
+    Search APIs often return a high-confidence song metadata match even when the
+    provider has no usable lyric body for that ID (for example NetEase returning
+    only 作词/作曲 credit lines). Hide those rows from the picker so "相关度 80"
+    doesn't look like a lyric match that then fails after clicking.
+    """
+    cid = candidate.get("id") or ""
+    if not cid or ":" not in cid:
+        return False
+    if cid in _candidate_usable_cache:
+        return _candidate_usable_cache[cid]
+    name, sid = cid.split(":", 1)
+    try:
+        raw = (fetch_lrclib_id(sid) if name == "lrclib" else
+               fetch_netease_id(sid) if name == "netease" else
+               fetch_kugou_id(sid) if name == "kugou" else None)
+        ok = bool(raw and usable_lyrics(parse_lrc(raw)))
+    except Exception:
+        ok = False
+    _candidate_usable_cache[cid] = ok
+    return ok
+
+
 @app.route("/api/candidates")
 def api_candidates():
     title = (request.args.get("title") or "").strip()
@@ -1326,6 +1352,8 @@ def api_candidates():
                     if not cid or cid in seen:
                         continue
                     seen.add(cid)
+                    if not candidate_has_usable_lyrics(c):
+                        continue
                     if qtitle != title:
                         c["album"] = ((c.get("album") or "") + f" · 原名匹配: {qtitle}").strip(" ·")
                         c["score"] = max(0, int(c.get("score") or 0) - penalty)

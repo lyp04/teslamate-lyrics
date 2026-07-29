@@ -1,10 +1,13 @@
 # Secrets & live config — never commit
 .env
+.env.*
+!.env.example
 teslamate.env
 
 # Runtime data (tokens, prefs, reports, oauth state, verify harness)
 data/
 oauth_state
+*.jsonl
 
 # Legacy host-specific operational script (Fleet API token grabber)
 grab.sh

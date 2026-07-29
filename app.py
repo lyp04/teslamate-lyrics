@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
-"""Tesla "now playing" + synced lyrics page.
+"""Tesla "now playing" and synchronized-lyrics web page.
 
-Reads the car's currently-playing track from the Tesla Owner API (media_info)
-and overlays time-synced lyrics from LRCLIB (primary) with NetEase fallback.
-By default it reuses TeslaMate's encrypted Owner API access token from the
-TeslaMate database without touching the refresh token. Per-song lyric
-source + timing offset are remembered server-side (only when the user adjusts
-them). Everything is browser-driven: no viewer open => no polling, no fetching.
-Bound to 127.0.0.1, served behind nginx + admin SSO.
+The app reuses TeslaMate's encrypted Owner API access token, reads the current
+media state, and confidence-gates matches from several lyric providers. Playback
+preferences stay in the browser; legacy server preferences are read only for
+migration. The supplied Compose setup publishes the service on loopback so an
+authenticated HTTPS reverse proxy can expose it safely.
 """
 import base64
 import concurrent.futures
 import hashlib
 import html
 import json
+import math
 import os
 import re
+import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
 import urllib.error
+from collections import OrderedDict
+from functools import wraps
 
 import psycopg2
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -74,19 +76,126 @@ TRANSLATE_TARGET_LANG = _env("TRANSLATE_TARGET_LANG", default="zh-CN")
 
 app = Flask(__name__)
 
+# Public-endpoint safety limits. These are deliberately well above normal song
+# metadata/lyrics sizes while still bounding anonymous work and memory use.
+MAX_REQUEST_BYTES = 64 * 1024
+MAX_UPSTREAM_BYTES = 2 * 1024 * 1024
+MAX_TITLE_CHARS = 200
+MAX_ARTIST_CHARS = 200
+MAX_SOURCE_CHARS = 2048
+MAX_DURATION_SECONDS = 24 * 60 * 60
+MAX_LRC_LINES = 300
+MAX_LRC_LINE_CHARS = 1000
+MAX_LRC_OUTPUT_CHARS = 100_000
+MAX_TIMESTAMPS_PER_LINE = 8
+MAX_TRANSLATE_LINES = 300
+MAX_TRANSLATE_LINE_CHARS = 500
+MAX_TRANSLATE_CHARS = 30_000
+MAX_TRANSLATE_NETWORK_CALLS = 8
+MAX_PREFS_ENTRIES = 5000
+MAX_REPORT_BYTES = 10 * 1024 * 1024
+MAX_REPORT_NOTE_CHARS = 500
+app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
+
+
+@app.after_request
+def _security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    if response.mimetype == "text/html":
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; font-src 'self'; object-src 'none'; "
+            "base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+        )
+    return response
+
+
+class BoundedTTLCache:
+    """Small thread-safe mapping with LRU eviction and TTL expiry."""
+
+    def __init__(self, maxsize, ttl):
+        self.maxsize = int(maxsize)
+        self.ttl = float(ttl)
+        self._data = OrderedDict()
+        self._lock = threading.RLock()
+
+    def _get(self, key):
+        value, created = self._data[key]
+        if time.monotonic() - created > self.ttl:
+            del self._data[key]
+            raise KeyError(key)
+        self._data.move_to_end(key)
+        return value
+
+    def __getitem__(self, key):
+        with self._lock:
+            return self._get(key)
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            self._data[key] = (value, time.monotonic())
+            self._data.move_to_end(key)
+            while len(self._data) > self.maxsize:
+                self._data.popitem(last=False)
+
+    def __contains__(self, key):
+        with self._lock:
+            try:
+                self._get(key)
+                return True
+            except KeyError:
+                return False
+
+    def get(self, key, default=None):
+        with self._lock:
+            try:
+                return self._get(key)
+            except KeyError:
+                return default
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+
+    def __len__(self):
+        with self._lock:
+            for key in list(self._data):
+                try:
+                    self._get(key)
+                except KeyError:
+                    pass
+            return len(self._data)
+
 _tok_lock = threading.Lock()
 _prefs_lock = threading.Lock()
+_reports_lock = threading.Lock()
 _state_lock = threading.Lock()
+_state_refresh_lock = threading.Lock()
+_expensive_slots = threading.BoundedSemaphore(3)
+# Provider work outlives the HTTP request when a faster source wins. Keep both
+# running and queued work globally bounded so anonymous callers cannot create an
+# unbounded number of background threads/futures.
+_provider_pool = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="lyrics-provider")
+_provider_slots = threading.BoundedSemaphore(10)
 _access = {"token": None, "exp": 0}
 _tm_access = {"token": None, "ts": 0.0}
 _vin_cache = {"vin": FORCED_VIN or None}
-_lyrics_cache = {}  # (key, source) -> list[[t,text]]
-_candidate_usable_cache = {}  # candidate id -> bool, avoids re-checking source-picker rows
+_lyrics_cache = BoundedTTLCache(512, 24 * 3600)
+_candidate_usable_cache = BoundedTTLCache(2048, 6 * 3600)
 # Short-TTL cache for /api/state so bursts (scheduled poll + visibilitychange,
 # extra tabs, retries) collapse into one Fleet API vehicle_data hit. The browser
 # already advances lyrics locally, so a couple seconds of staleness is invisible.
 _state_cache = {"data": None, "ts": 0.0}
 STATE_TTL = float(_env("STATE_TTL", default="2.0"))
+STATE_STALE_TTL = float(_env("STATE_STALE_TTL", default="30.0"))
 
 # Debug-only audit hook: each lyrics source records the candidate it actually served
 # here (keyed by source name). Never read by production logic — the offline
@@ -103,14 +212,106 @@ def _record_pick(source, title="", artist="", duration=None, sid=None, via=None)
         pass
 
 
+class _SameHostHTTPSRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only when they stay HTTPS on the original hostname."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
+        if new.scheme != "https" or new.hostname != old.hostname:
+            raise urllib.error.HTTPError(newurl, code, "unsafe_redirect", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_HTTP_OPENER = urllib.request.build_opener(_SameHostHTTPSRedirectHandler())
+
+
 def _http(url, data=None, headers=None, timeout=15):
+    target = urllib.parse.urlsplit(url)
+    if target.scheme != "https" or not target.hostname:
+        raise ValueError("https_required")
     req = urllib.request.Request(url, data=data, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.status, r.read().decode("utf-8", "replace")
+    with _HTTP_OPENER.open(req, timeout=timeout) as r:
+        raw = r.read(MAX_UPSTREAM_BYTES + 1)
+        if len(raw) > MAX_UPSTREAM_BYTES:
+            raise ValueError("upstream_response_too_large")
+        return r.status, raw.decode("utf-8", "replace")
+
+
+def _atomic_write_json(path, payload):
+    """Write private JSON mode-0600 from the first byte, then atomically replace."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            fd = -1
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
 
 def song_key(title, artist):
     return (title or "").strip().lower() + "|" + (artist or "").strip().lower()
+
+
+def _valid_source(source):
+    """Allow known providers and opaque provider IDs, never arbitrary schemes."""
+    if not isinstance(source, str) or not source or len(source) > MAX_SOURCE_CHARS:
+        return False
+    if source == "auto" or source in SOURCES:
+        return True
+    if ":" not in source:
+        return False
+    provider, opaque_id = source.split(":", 1)
+    return (provider in {"lrclib", "netease", "kugou", "petitlyrics"}
+            and bool(re.fullmatch(r"[A-Za-z0-9._~+/=:-]{1,2030}", opaque_id)))
+
+
+def _song_query(include_source=False):
+    title = (request.args.get("title") or "").strip()
+    artist = (request.args.get("artist") or "").strip()
+    raw_duration = request.args.get("duration")
+    try:
+        duration = float(raw_duration) if raw_duration not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+    if (not title or len(title) > MAX_TITLE_CHARS or len(artist) > MAX_ARTIST_CHARS
+            or (duration is not None and
+                (not math.isfinite(duration) or duration < 0 or duration > MAX_DURATION_SECONDS))):
+        return None
+    if not include_source:
+        return title, artist, duration
+    source = (request.args.get("source") or "auto").strip()
+    if not _valid_source(source):
+        return None
+    return title, artist, duration, source
+
+
+def _limit_expensive(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not _expensive_slots.acquire(blocking=False):
+            return jsonify({"ok": False, "error": "busy"}), 429
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _expensive_slots.release()
+    return wrapped
 
 
 # ---------------- Tesla token + media ----------------
@@ -120,11 +321,7 @@ def _load_refresh():
 
 
 def _save_refresh(rt):
-    tmp = TOKEN_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump({"refresh_token": rt}, f)
-    os.replace(tmp, TOKEN_FILE)
-    os.chmod(TOKEN_FILE, 0o600)
+    _atomic_write_json(TOKEN_FILE, {"refresh_token": rt})
 
 
 def _cloak_decrypt_aes_gcm(ciphertext):
@@ -195,9 +392,37 @@ def get_access():
         return _access["token"]
 
 
+def _load_default_vin_from_teslamate():
+    if not TESLAMATE_DB_PASS:
+        return None
+    with psycopg2.connect(
+        host=TESLAMATE_DB_HOST,
+        dbname=TESLAMATE_DB_NAME,
+        user=TESLAMATE_DB_USER,
+        password=TESLAMATE_DB_PASS,
+        connect_timeout=5,
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT vin
+                FROM cars
+                WHERE vin IS NOT NULL AND vin <> ''
+                ORDER BY display_priority ASC, id ASC
+                LIMIT 1
+                """
+            )
+            row = cur.fetchone()
+    return row[0] if row else None
+
+
 def get_vin(access):
     if _vin_cache["vin"]:
         return _vin_cache["vin"]
+    vin = _load_default_vin_from_teslamate()
+    if vin:
+        _vin_cache["vin"] = vin
+        return vin
     _, txt = _http(API_HOST + "/api/1/vehicles", headers={"Authorization": "Bearer " + access})
     arr = json.loads(txt).get("response") or []
     if arr:
@@ -214,9 +439,28 @@ def _store_state(data):
 
 @app.route("/api/state")
 def api_state():
+    now = time.time()
     with _state_lock:
-        if _state_cache["data"] is not None and time.time() - _state_cache["ts"] < STATE_TTL:
-            return jsonify(_state_cache["data"])
+        cached = _state_cache["data"]
+        age = now - _state_cache["ts"]
+    if cached is not None and age < STATE_TTL:
+        return jsonify(cached)
+
+    # Only one request performs the Tesla API refresh. Other tabs receive a
+    # recent stale value, or wait on a cold start and reuse the completed result.
+    acquired = _state_refresh_lock.acquire(blocking=False)
+    if not acquired:
+        if cached is not None and age < STATE_STALE_TTL:
+            return jsonify(cached)
+        with _state_refresh_lock:
+            pass
+        with _state_lock:
+            cached = _state_cache["data"]
+            age = time.time() - _state_cache["ts"]
+        if cached is not None and age < STATE_STALE_TTL:
+            return jsonify(cached)
+        return jsonify({"ok": False, "error": "upstream_unavailable"}), 502
+
     try:
         access = get_access()
         vin = get_vin(access)
@@ -246,11 +490,16 @@ def api_state():
             "duration": (mi.get("now_playing_duration") or 0) / 1000.0,
             "ts": time.time(),
         }))
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 502
+    except Exception:
+        app.logger.exception("state refresh failed")
+        if cached is not None and age < STATE_STALE_TTL:
+            return jsonify(cached)
+        return jsonify({"ok": False, "error": "upstream_unavailable"}), 502
+    finally:
+        _state_refresh_lock.release()
 
 
-# ---------------- Lyrics (LRCLIB / NetEase) ----------------
+# ---------------- Lyrics providers and matching ----------------
 _TS = re.compile(r"\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?\]")
 _META = re.compile(r"^\[[a-zA-Z]+:")
 _CJK = re.compile(r"[\u4e00-\u9fff]{2,}")
@@ -263,6 +512,8 @@ _CREDIT = re.compile(
     r"produc(ed|er|ers|tion)|a\s*&\s*r|engineer(ing|ed)?|artwork|written|composed|arranged|mix(ed|ing)|master(ed|ing)|record(ed|ing)?|studio|"
     r"lyric(s|ist)?|compos(er|ed)|vocal|guitar|bass|drums|piano|violin|cello|viola|keyboards?|strings|flute|sax|programm(ed|ing)|OP|SP|ISRC)[^:\uff1a\n]{0,10}[:\uff1a]", re.I)
 _BAD_ALIAS = {"原唱", "钢琴", "钢琴曲", "纯音乐", "华语", "流行", "合辑", "音乐", "经典", "热门", "翻唱", "伴奏"}
+# Keep the public tree free of an operator's listening fingerprints. Cross-script
+# aliases and native titles are recovered from provider metadata at runtime.
 _ARTIST_ALIASES = {}
 # Apple Music / Tesla metadata often reports Mandarin tracks under English
 # translations or pinyin. Native title+artist are recovered generically at
@@ -272,11 +523,17 @@ _SONG_SOURCE_OVERRIDES = {}
 
 
 def parse_lrc(text):
+    """Parse a bounded LRC payload; reject amplification-shaped input entirely."""
     out = []
-    for line in text.splitlines():
+    output_chars = 0
+    for line in (text or "").splitlines():
+        if len(line) > MAX_LRC_LINE_CHARS:
+            return []
         stamps = _TS.findall(line)
         if not stamps:
             continue
+        if len(stamps) > MAX_TIMESTAMPS_PER_LINE or len(out) + len(stamps) > MAX_LRC_LINES:
+            return []
         body = _TS.sub("", line).strip()
         if _META.match(line) and not body:
             continue
@@ -284,9 +541,14 @@ def parse_lrc(text):
             continue
         if re.match(r"^.+\s+-\s+.+$", body) and int(stamps[0][0]) == 0:
             continue
+        output_chars += len(body) * len(stamps)
+        if output_chars > MAX_LRC_OUTPUT_CHARS:
+            return []
         for mm, ss, fr in stamps:
             frac = float("0." + fr) if fr else 0.0
-            out.append([round(int(mm) * 60 + int(ss) + frac, 2), body])
+            timestamp = round(int(mm) * 60 + int(ss) + frac, 2)
+            if timestamp <= MAX_DURATION_SECONDS:
+                out.append([timestamp, body])
     out.sort(key=lambda x: x[0])
     return out
 
@@ -296,8 +558,16 @@ def usable_lyrics(lines):
 
 
 def make_approx_lrc(lines, duration=None):
-    clean = [re.sub(r"\s+", " ", x or "").strip() for x in lines]
-    clean = [x for x in clean if x]
+    clean = []
+    total_chars = 0
+    for value in lines:
+        value = re.sub(r"\s+", " ", value or "").strip()
+        if not value or len(value) > MAX_LRC_LINE_CHARS:
+            continue
+        if len(clean) >= MAX_LRC_LINES or total_chars + len(value) > MAX_LRC_OUTPUT_CHARS:
+            break
+        clean.append(value)
+        total_chars += len(value)
     if not clean:
         return None
     dur = float(duration or max(90, len(clean) * 5))
@@ -339,7 +609,7 @@ def _t2s(s):
 
 
 # Katakana -> romaji, so a romanized Apple artist name can match the native
-# katakana form on NetEase. Approximate but enough for matching.
+# katakana form on NetEase. Approximate but sufficient for candidate matching.
 _KATA = {
     'ア':'a','イ':'i','ウ':'u','エ':'e','オ':'o','カ':'ka','キ':'ki','ク':'ku','ケ':'ke','コ':'ko',
     'サ':'sa','シ':'shi','ス':'su','セ':'se','ソ':'so','タ':'ta','チ':'chi','ツ':'tsu','テ':'te','ト':'to',
@@ -499,21 +769,25 @@ def _artist_match(qartist, cartist, aliases):
 
 
 def _match_ok(qt, qa, qd, ct, ca, cd, aliases):
-    """Confidence gate for the loose sources (NetEase/KuGou): only trust a candidate's
-    lyrics when its identity actually matches the query, so a same/similar-titled
-    *popular* song can't be served for an obscure one. Duration is the romanization-
-    robust anchor; a trad/simp-folded title OR an alias-aware artist match must
-    corroborate it."""
-    dd = abs(float(cd) - float(qd)) if (qd and cd) else None
+    """Fail closed unless the candidate describes the queried recording."""
+    try:
+        dd = abs(float(cd) - float(qd)) if (qd and cd) else None
+    except (TypeError, ValueError):
+        dd = None
     t = _title_match(qt, ct)
     a = _artist_match(qa, ca, aliases)
-    if t and a:                                  # both identity signals agree
-        return dd is None or dd <= 16
-    if t and not a:                              # same title, different/unknown artist (a
-        return dd is not None and dd <= 6        # generic title like "Collide") -> demand tight duration
-    if a and not t:                              # same artist, cross-script title -> demand tight duration
-        return dd is not None and dd <= 6
-    return False
+    title_known = bool((qt or "").strip() and (ct or "").strip())
+    artist_known = bool((qa or "").strip() and (ca or "").strip())
+    if title_known and not t:
+        return False
+    if artist_known and not a:
+        return False
+    if not title_known and not artist_known:
+        return False
+    if dd is not None and dd > 6:
+        return False
+    # If either metadata field is absent, duration must provide the second anchor.
+    return (title_known and artist_known) or dd is not None
 
 
 def fetch_netease(title, artist, duration=None):
@@ -588,12 +862,13 @@ def _dedupe(seq):
     return out
 
 
-_artist_alias_cache = {}
+_artist_alias_cache = BoundedTTLCache(512, 6 * 3600)
 
 
 def artist_query_aliases(artist):
-    if artist in _artist_alias_cache:
-        return _artist_alias_cache[artist]
+    cached = _artist_alias_cache.get(artist)
+    if cached is not None:
+        return cached
     aliases = [artist] + _ARTIST_ALIASES.get(artist, [])
     # Generic Apple Music case: English artist name, Chinese song catalog.
     # NetEase search for the artist usually exposes the local Chinese spelling.
@@ -628,8 +903,8 @@ _INSTRUMENTAL = re.compile(
 _COMPILATION = re.compile(
     r"(最新|热歌|熱歌|慢摇|慢搖|串烧|串燒|精选|精選|合辑|合輯|合集|排行|金曲|對唱|对唱|網絡|网络|"
     r"抖音|快手|车载|車載|纯享|純享|翻唱|cover|various|v\.?\s*a\.?|群星|榜|歌单|歌單)", re.I)
-_native_cache = {}
-_auto_cache = {}  # song_key -> (source, lines) for resolved auto lookups (replay = instant)
+_native_cache = BoundedTTLCache(512, 6 * 3600)
+_auto_cache = BoundedTTLCache(512, 24 * 3600)
 
 
 def _itunes_search(term, country, limit=8, timeout=6):
@@ -655,8 +930,9 @@ def recover_native_meta(title, artist, duration=None, limit=4):
     if not title or has_cjk(title) or not duration:
         return []
     ck = (_latin_key(title), _latin_key(artist), int(duration) // 2)
-    if ck in _native_cache:
-        return _native_cache[ck]
+    cached = _native_cache.get(ck)
+    if cached is not None:
+        return cached
     term = (title + " " + artist).strip()
     results = []
     try:
@@ -747,10 +1023,25 @@ def _try_sources(qtitle, qartist, duration, order, deadline=5.0, grace=0.6):
                 return lines
         return None
 
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(order)))
-    futs = {ex.submit(run, n): n for n in order}
-    found, done, pending = {}, set(), set(futs)
-    start, first_hit = time.time(), None
+    futs, done = {}, set()
+    for name in order:
+        if not _provider_slots.acquire(blocking=False):
+            done.add(name)
+            continue
+        try:
+            fut = _provider_pool.submit(run, name)
+        except Exception:
+            _provider_slots.release()
+            done.add(name)
+            continue
+        fut.add_done_callback(lambda _f: _provider_slots.release())
+        futs[fut] = name
+    found, pending = {}, set(futs)
+    start, first_hit = time.monotonic(), None
+
+    def cancel_pending():
+        for fut in pending:
+            fut.cancel()
 
     def decide():
         # Earliest source in `order` that has a hit wins; if an earlier source is
@@ -763,7 +1054,8 @@ def _try_sources(qtitle, qartist, duration, order, deadline=5.0, grace=0.6):
         return None, None
 
     while pending:
-        budget = (first_hit + grace if first_hit is not None else start + deadline) - time.time()
+        now = time.monotonic()
+        budget = (first_hit + grace if first_hit is not None else start + deadline) - now
         done_now, pending = concurrent.futures.wait(
             pending, timeout=max(0.0, budget), return_when=concurrent.futures.FIRST_COMPLETED)
         if not done_now:          # grace window (or overall deadline) elapsed
@@ -777,12 +1069,12 @@ def _try_sources(qtitle, qartist, duration, order, deadline=5.0, grace=0.6):
             if lines:
                 found[futs[fut]] = lines
                 if first_hit is None:
-                    first_hit = time.time()
+                    first_hit = time.monotonic()
         verdict = decide()
         if verdict is not False:
-            ex.shutdown(wait=False)
+            cancel_pending()
             return verdict
-    ex.shutdown(wait=False)
+    cancel_pending()
     for n in order:
         if n in found:
             return n, found[n]
@@ -805,7 +1097,7 @@ def search_kugou(title, artist, duration, limit=5):
     seen = set()
     out = []
     for qtxt in queries:
-        _, txt = _http("http://lyrics.kugou.com/search?" + urllib.parse.urlencode({
+        _, txt = _http("https://lyrics.kugou.com/search?" + urllib.parse.urlencode({
             "ver": 1, "man": "yes", "client": "pc", "keyword": qtxt,
             "duration": int(duration or 0)
         }), headers=h, timeout=6)
@@ -840,7 +1132,7 @@ def fetch_kugou_id(token):
         return None
     cid, ak = parts
     h = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
-    _, txt = _http("http://lyrics.kugou.com/download?" + urllib.parse.urlencode({
+    _, txt = _http("https://lyrics.kugou.com/download?" + urllib.parse.urlencode({
         "ver": 1, "client": "pc", "id": cid, "accesskey": ak,
         "fmt": "lrc", "charset": "utf8"
     }), headers=h, timeout=6)
@@ -860,6 +1152,181 @@ def fetch_kugou(title, artist, duration=None):
             _record_pick("kugou", c.get("title"), c.get("artist"), c.get("duration"), c.get("id"))
             return raw
     return None
+
+
+
+
+# ---------------- PetitLyrics (JP catalog / word-sync) -------------------------
+# Unofficial but long-lived client endpoint used by the MusicBee PetitLyrics plugin.
+# lyricsType=3 returns word-sync XML; we collapse each line to a normal LRC timestamp
+# using the first word start time.  If a song only has plain text, fall back to an
+# approximate timeline so it is still displayable.
+_PETIT_BASE = "https://p0.petitlyrics.com/api/GetPetitLyricsData.php"
+_PETIT_APP_ID = os.environ.get("PETITLYRICS_CLIENT_APP_ID", "p1110417")
+_PETIT_HDRS = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    "User-Agent": "MusicBee.PetitLyrics",
+}
+
+
+def _petit_call(title=None, artist=None, album=None, duration=None, lyrics_type="3"):
+    params = {
+        "clientAppId": _PETIT_APP_ID,
+        "lyricsType": str(lyrics_type),
+        "terminalType": "10",
+        "key_title": title or "",
+        "key_artist": artist or "",
+        "key_album": album or "",
+    }
+    if duration:
+        # Endpoint accepts duration in milliseconds and uses it as a fuzzy matcher.
+        params["duration"] = str(int(float(duration) * 1000))
+    _, txt = _http(_PETIT_BASE, data=urllib.parse.urlencode(params).encode("utf-8"),
+                   headers=_PETIT_HDRS, timeout=8)
+    try:
+        import xml.etree.ElementTree as ET
+        return ET.fromstring(txt)
+    except Exception:
+        return None
+
+
+def _petit_decode_lyrics_data(text):
+    if not text:
+        return ""
+    try:
+        return base64.b64decode(text).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
+def _petit_song_meta(song):
+    def tx(name):
+        return (song.findtext(name) or "").strip()
+    dur = 0.0
+    try:
+        dur = float(tx("duration") or 0) / 1000.0
+    except Exception:
+        dur = 0.0
+    return {
+        "lyrics_id": tx("lyricsId"),
+        "title": tx("title"),
+        "artist": tx("artist"),
+        "album": tx("album"),
+        "duration": dur,
+        "lyrics_type": tx("lyricsType"),
+        "available_type": tx("availableLyricsType"),
+    }
+
+
+def _petit_token(meta):
+    raw = json.dumps({"t": meta.get("title") or "", "a": meta.get("artist") or "",
+                      "b": meta.get("album") or "", "d": meta.get("duration") or 0},
+                     ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _petit_untoken(token):
+    try:
+        raw = token + "=" * (-len(token) % 4)
+        d = json.loads(base64.urlsafe_b64decode(raw.encode("ascii")).decode("utf-8"))
+        return d.get("t") or "", d.get("a") or "", d.get("b") or "", d.get("d") or None
+    except Exception:
+        return "", "", "", None
+
+
+def _petit_wordxml_to_lrc(xml_text):
+    if not xml_text or "<wsy" not in xml_text:
+        return None
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return None
+    out = []
+    for line in root.findall(".//line"):
+        text = (line.findtext("linestring") or "").strip()
+        if not text:
+            continue
+        starts = []
+        for w in line.findall("word"):
+            try:
+                starts.append(int(w.findtext("starttime") or 0))
+            except Exception:
+                pass
+        if not starts:
+            continue
+        sec = min(starts) / 1000.0
+        out.append(f"[{int(sec // 60):02d}:{sec % 60:05.2f}]{text}")
+    return "\n".join(out) if out else None
+
+
+def _petit_fetch_raw(title, artist, album="", duration=None):
+    # Prefer word-sync; fall back to plain text if the song only has text lyrics.
+    aliases = artist_query_aliases(artist)
+    for lt in ("3", "1"):
+        root = _petit_call(title, artist, album, duration, lyrics_type=lt)
+        songs = root.findall(".//song") if root is not None else []
+        for song in songs:
+            meta = _petit_song_meta(song)
+            if not _match_ok(
+                    title, artist, duration,
+                    meta.get("title") or "", meta.get("artist") or "",
+                    meta.get("duration") or 0, aliases):
+                continue
+            raw = _petit_decode_lyrics_data(song.findtext("lyricsData"))
+            if not raw:
+                continue
+            if lt == "3":
+                lrc = _petit_wordxml_to_lrc(raw)
+                if lrc and _TS.search(lrc):
+                    _record_pick("petitlyrics", meta.get("title"), meta.get("artist"), meta.get("duration"), meta.get("lyrics_id"), via="wordsync")
+                    return lrc
+            else:
+                lines = [x.strip() for x in raw.splitlines() if x.strip()]
+                lrc = make_approx_lrc(lines, duration or meta.get("duration"))
+                if lrc:
+                    _record_pick("petitlyrics", meta.get("title"), meta.get("artist"), meta.get("duration"), meta.get("lyrics_id"), via="plain")
+                    return lrc
+    return None
+
+
+def fetch_petitlyrics(title, artist, duration=None):
+    return _petit_fetch_raw(title, artist, "", duration)
+
+
+def fetch_petitlyrics_id(token):
+    title, artist, album, duration = _petit_untoken(token)
+    if not title:
+        return None
+    return _petit_fetch_raw(title, artist, album, duration)
+
+
+def search_petitlyrics(title, artist, duration, limit=5):
+    root = _petit_call(title, artist, "", duration, lyrics_type="3")
+    songs = root.findall(".//song") if root is not None else []
+    out = []
+    aliases = artist_query_aliases(artist)
+    for i, song in enumerate(songs):
+        meta = _petit_song_meta(song)
+        dur = meta.get("duration") or 0
+        if not _match_ok(
+                title, artist, duration,
+                meta.get("title") or "", meta.get("artist") or "", dur, aliases):
+            continue
+        score = 84 - i * 6
+        if title and title_matches(title, meta.get("title") or ""):
+            score += 8
+        if artist and _artist_match(artist, meta.get("artist") or "", artist_query_aliases(artist)):
+            score += 8
+        if duration and dur:
+            score -= abs(float(dur) - float(duration)) / 3
+        out.append({"id": f"petitlyrics:{_petit_token(meta)}", "source": "petitlyrics",
+                    "title": meta.get("title") or "", "artist": meta.get("artist") or "",
+                    "album": meta.get("album") or "", "duration": dur,
+                    "score": round(max(0, score))})
+        if len(out) >= limit:
+            break
+    return out
 
 
 # ---------------- Musixmatch (Apple Music's own lyrics provider) ----------------
@@ -893,8 +1360,7 @@ def _mxm_token():
             if tk and len(tk) > 20:
                 _mxm_tok.update(token=tk, exp=time.time() + 600)
                 try:
-                    with open(_MXM_TOKEN_FILE, "w") as f:
-                        json.dump({"token": tk}, f)
+                    _atomic_write_json(_MXM_TOKEN_FILE, {"token": tk})
                 except Exception:
                     pass
                 return tk
@@ -994,7 +1460,7 @@ def fetch_musixmatch(title, artist, duration=None):
 
 
 SOURCES = {"musixmatch": fetch_musixmatch, "lrclib": fetch_lrclib, "netease": fetch_netease,
-           "kugou": fetch_kugou, "plain": fetch_plain_fallback}
+           "kugou": fetch_kugou, "petitlyrics": fetch_petitlyrics, "plain": fetch_plain_fallback}
 
 
 def _mxm_warmup():
@@ -1011,13 +1477,13 @@ def _mxm_warmup():
         tk = _mxm_fetch_token()
         if tk and len(tk) > 20:
             _mxm_tok.update(token=tk, exp=time.time() + 600)
-            with open(_MXM_TOKEN_FILE, "w") as f:
-                json.dump({"token": tk}, f)
+            _atomic_write_json(_MXM_TOKEN_FILE, {"token": tk})
     except Exception:
         pass
 
 
-threading.Thread(target=_mxm_warmup, daemon=True).start()
+if os.environ.get("DISABLE_MXM_WARMUP") != "1":
+    threading.Thread(target=_mxm_warmup, daemon=True).start()
 
 
 def _override_source(title, artist):
@@ -1028,14 +1494,23 @@ def _override_source(title, artist):
     return None
 
 
+def _duration_cache_bucket(duration):
+    """Two-second buckets keep duration-sensitive matches isolated without churn."""
+    try:
+        return int(round(float(duration or 0) / 2.0) * 2)
+    except (TypeError, ValueError):
+        return 0
+
+
 def get_lyrics(title, artist, duration, source):
     override = _override_source(title, artist) if source == "auto" else None
     if override:
         source = override
     if source == "plain":
-        key = (song_key(title, artist), "plain")
-        if key in _lyrics_cache:
-            return source, _lyrics_cache[key]
+        key = (song_key(title, artist), "plain", _duration_cache_bucket(duration))
+        cached = _lyrics_cache.get(key)
+        if cached is not None:
+            return source, cached
         try:
             raw = fetch_plain_fallback(title, artist, duration)
         except Exception:
@@ -1049,12 +1524,14 @@ def get_lyrics(title, artist, duration, source):
     if ":" in source:
         name, sid = source.split(":", 1)
         key = (song_key(title, artist), source)
-        if key in _lyrics_cache:
-            return source, _lyrics_cache[key]
+        cached = _lyrics_cache.get(key)
+        if cached is not None:
+            return source, cached
         try:
             raw = (fetch_lrclib_id(sid) if name == "lrclib" else
                    fetch_netease_id(sid) if name == "netease" else
-                   fetch_kugou_id(sid) if name == "kugou" else None)
+                   fetch_kugou_id(sid) if name == "kugou" else
+                   fetch_petitlyrics_id(sid) if name == "petitlyrics" else None)
         except Exception:
             raw = None
         if raw:
@@ -1064,11 +1541,12 @@ def get_lyrics(title, artist, duration, source):
                 return source, lines
         return None, []
     # chosen source first, then always fall back to the others until one hits
-    base = ["plain", "musixmatch", "lrclib", "netease", "kugou"] if _latin_key(title) in _PLAIN_LYRIC_URLS else ["musixmatch", "lrclib", "netease", "kugou", "plain"]
+    base = ["plain", "musixmatch", "lrclib", "netease", "kugou"] if _latin_key(title) in _PLAIN_LYRIC_URLS else ["musixmatch", "lrclib", "petitlyrics", "netease", "kugou", "plain"]
     order = ([source] + [s for s in base if s != source]) if source in SOURCES else base
-    sk = song_key(title, artist)
-    if source == "auto" and sk in _auto_cache:   # replay of an already-resolved song -> instant
-        return _auto_cache[sk]
+    sk = (song_key(title, artist), _duration_cache_bucket(duration))
+    cached = _auto_cache.get(sk) if source == "auto" else None
+    if cached is not None:   # replay of an already-resolved song -> instant
+        return cached
     rest = [s for s in order if s != "musixmatch"]   # Musixmatch handled by the probe below
 
     def probe(qt, qa):
@@ -1215,15 +1693,16 @@ def furigana_lines(lines):
 
 # ---------------- Translation (Google gtx endpoint, batched + cached) ----------
 _GT_HDRS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
-_trans_cache = {}
+_trans_cache = BoundedTTLCache(256, 6 * 3600)
 _trans_lock = threading.Lock()
 
 
 def _gt_batch(texts, tl):
-    q = "\n".join(texts)
+    payload = urllib.parse.urlencode({"q": "\n".join(texts)}).encode("utf-8")
     url = ("https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl="
-           + urllib.parse.quote(tl) + "&dt=t&q=" + urllib.parse.quote(q))
-    _, txt = _http(url, headers=_GT_HDRS, timeout=12)
+           + urllib.parse.quote(tl) + "&dt=t")
+    headers = dict(_GT_HDRS, **{"Content-Type": "application/x-www-form-urlencoded"})
+    _, txt = _http(url, data=payload, headers=headers, timeout=6)
     segs = json.loads(txt)[0] or []
     joined = "".join(s[0] for s in segs if s and s[0])
     return joined.split("\n")
@@ -1239,28 +1718,30 @@ def is_chinese_lyrics(texts):
 
 
 def _translate_raw(texts, tl):
-    """Google gtx translate with a batch pass and a per-line fallback whenever the
-    batch loses 1:1 alignment with the input."""
-    out = []
-    B = 40
-    for i in range(0, len(texts), B):
-        chunk = texts[i:i + B]
+    """Translate in bounded batches with a strict total network-call budget."""
+    calls = 0
+
+    def translate_chunk(chunk):
+        nonlocal calls
+        if not chunk or calls >= MAX_TRANSLATE_NETWORK_CALLS:
+            return ["" for _ in chunk]
+        calls += 1
         try:
             got = _gt_batch(chunk, tl)
         except Exception:
             got = []
-        if len(got) != len(chunk):               # alignment lost -> per-line, exact
-            got = []
-            for t in chunk:
-                if not t.strip():
-                    got.append("")
-                    continue
-                try:
-                    g = _gt_batch([t], tl)
-                    got.append(g[0] if g else "")
-                except Exception:
-                    got.append("")
-        out.extend(got)
+        if len(got) == len(chunk):
+            return got
+        # Split a misaligned batch only while budget remains. This preserves exact
+        # alignment without the former worst case of 300 serial 12-second calls.
+        if len(chunk) <= 1 or calls >= MAX_TRANSLATE_NETWORK_CALLS:
+            return ["" for _ in chunk]
+        mid = len(chunk) // 2
+        return translate_chunk(chunk[:mid]) + translate_chunk(chunk[mid:])
+
+    out = []
+    for i in range(0, len(texts), 40):
+        out.extend(translate_chunk(texts[i:i + 40]))
     return out
 
 
@@ -1279,6 +1760,21 @@ def translate_lines(texts, tl="zh-CN"):
     return out
 
 
+def candidate_identity_matches_query(title, artist, duration, candidate):
+    """Keep loose provider rows from showing lyrics for a different song.
+
+    A provider search can return a perfectly lyric-bearing but unrelated song
+    by the same/near title. Usability alone is not enough for the picker: the row
+    must also match the queried track identity.
+    """
+    source = candidate.get("source") or (candidate.get("id") or "").split(":", 1)[0]
+    if source not in {"netease", "kugou", "petitlyrics"}:
+        return True
+    return _match_ok(title, artist, duration, candidate.get("title") or "",
+                     candidate.get("artist") or "", candidate.get("duration") or 0,
+                     artist_query_aliases(artist))
+
+
 def candidate_has_usable_lyrics(candidate):
     """Return True only when a source-picker candidate can actually serve lyrics.
 
@@ -1290,27 +1786,32 @@ def candidate_has_usable_lyrics(candidate):
     cid = candidate.get("id") or ""
     if not cid or ":" not in cid:
         return False
-    if cid in _candidate_usable_cache:
-        return _candidate_usable_cache[cid]
+    sentinel = object()
+    cached = _candidate_usable_cache.get(cid, sentinel)
+    if cached is not sentinel:
+        return cached
     name, sid = cid.split(":", 1)
     try:
         raw = (fetch_lrclib_id(sid) if name == "lrclib" else
                fetch_netease_id(sid) if name == "netease" else
-               fetch_kugou_id(sid) if name == "kugou" else None)
+               fetch_kugou_id(sid) if name == "kugou" else
+               fetch_petitlyrics_id(sid) if name == "petitlyrics" else None)
         ok = bool(raw and usable_lyrics(parse_lrc(raw)))
     except Exception:
-        ok = False
+        # A provider timeout is not evidence that lyrics do not exist. Do not
+        # turn a transient failure into a six-hour negative cache entry.
+        return False
     _candidate_usable_cache[cid] = ok
     return ok
 
 
 @app.route("/api/candidates")
+@_limit_expensive
 def api_candidates():
-    title = (request.args.get("title") or "").strip()
-    artist = (request.args.get("artist") or "").strip()
-    duration = request.args.get("duration", type=float)
-    if not title:
-        return jsonify({"ok": False, "error": "no_title"})
+    parsed = _song_query()
+    if parsed is None:
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    title, artist, duration = parsed
     cand = []
     seen = set()
     natives = recover_native_meta(title, artist, duration)
@@ -1320,7 +1821,7 @@ def api_candidates():
     query_pairs = [(nt, na, 3) for nt, na in natives] + [(title, artist, 0)]
     for qtitle, qartist, penalty in query_pairs:
         # KuGou is a Chinese-only catalog and slow on Latin queries — skip it there.
-        fns = (search_lrclib, search_netease, search_kugou) if has_cjk(qtitle) else (search_lrclib, search_netease)
+        fns = (search_lrclib, search_petitlyrics, search_netease, search_kugou) if has_cjk(qtitle) else (search_lrclib, search_petitlyrics, search_netease)
         for fn in fns:
             try:
                 for c in fn(qtitle, qartist, duration, limit=5):
@@ -1328,6 +1829,8 @@ def api_candidates():
                     if not cid or cid in seen:
                         continue
                     seen.add(cid)
+                    if not candidate_identity_matches_query(qtitle, qartist, duration, c):
+                        continue
                     if not candidate_has_usable_lyrics(c):
                         continue
                     if qtitle != title:
@@ -1341,13 +1844,12 @@ def api_candidates():
 
 
 @app.route("/api/lyrics")
+@_limit_expensive
 def api_lyrics():
-    title = (request.args.get("title") or "").strip()
-    artist = (request.args.get("artist") or "").strip()
-    duration = request.args.get("duration", type=float)
-    source = (request.args.get("source") or "auto").strip()
-    if not title:
-        return jsonify({"ok": False, "error": "no_title"})
+    parsed = _song_query(include_source=True)
+    if parsed is None:
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    title, artist, duration, source = parsed
     used, lines = get_lyrics(title, artist, duration, source)
     # `translatable` is False for Chinese lyrics under a Chinese target: the UI
     # hides the 翻译 button there, since translating would only duplicate them.
@@ -1360,22 +1862,42 @@ def api_lyrics():
 
 
 @app.route("/api/translate", methods=["POST"])
+@_limit_expensive
 def api_translate():
     """Translate the current lyric lines (default -> Simplified Chinese)."""
-    body = request.get_json(force=True, silent=True) or {}
-    lines = [str(x or "") for x in (body.get("lines") or [])]
-    tl = (body.get("tl") or TRANSLATE_TARGET_LANG).strip() or TRANSLATE_TARGET_LANG
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "json_required"}), 415
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or not isinstance(body.get("lines", []), list):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    raw_lines = body.get("lines") or []
+    if (len(raw_lines) > MAX_TRANSLATE_LINES
+            or any(not isinstance(x, str) or len(x) > MAX_TRANSLATE_LINE_CHARS for x in raw_lines)):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    lines = list(raw_lines)
+    if sum(len(x) for x in lines) > MAX_TRANSLATE_CHARS:
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    tl = body.get("tl") or TRANSLATE_TARGET_LANG
+    if (not isinstance(tl, str) or not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z]{2,8})?", tl)
+            or tl.lower() != TRANSLATE_TARGET_LANG.lower()):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
     if not lines:
         return jsonify({"ok": True, "trans": []})
-    key = "|".join([body.get("title") or "", body.get("artist") or "",
-                    body.get("source") or "", tl, str(len(lines))])
+    digest = hashlib.sha256(json.dumps(lines, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+    key = (tl.lower(), digest)
     with _trans_lock:
         cached = _trans_cache.get(key)
-    if cached and len(cached) == len(lines):
+    if cached is not None and len(cached) == len(lines):
         return jsonify({"ok": True, "trans": cached, "cached": True})
     trans = translate_lines(lines, tl)
-    with _trans_lock:
-        _trans_cache[key] = trans
+    # Cache only complete results. Provider timeouts/misaligned batches produce
+    # blanks for non-empty source lines; caching those would preserve a transient
+    # Google failure for six hours.
+    complete = all(not source.strip() or bool(target.strip())
+                   for source, target in zip(lines, trans))
+    if complete:
+        with _trans_lock:
+            _trans_cache[key] = trans
     return jsonify({"ok": True, "trans": trans})
 
 
@@ -1383,36 +1905,53 @@ def api_translate():
 def _load_prefs():
     try:
         with open(PREFS_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
 def _write_prefs(d):
-    tmp = PREFS_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(d, f, ensure_ascii=False)
-    os.replace(tmp, PREFS_FILE)
+    _atomic_write_json(PREFS_FILE, d)
 
 
 @app.route("/api/prefs", methods=["GET", "POST"])
 def api_prefs():
     if request.method == "GET":
-        key = song_key(request.args.get("title", ""), request.args.get("artist", ""))
+        title = request.args.get("title", "")
+        artist = request.args.get("artist", "")
+        if len(title) > MAX_TITLE_CHARS or len(artist) > MAX_ARTIST_CHARS:
+            return jsonify({"ok": False, "error": "invalid_input"}), 400
+        key = song_key(title, artist)
         p = _load_prefs().get(key) or {}
         return jsonify({"source": p.get("source", "auto"), "offset": p.get("offset", 0)})
-    body = request.get_json(force=True, silent=True) or {}
-    key = song_key(body.get("title", ""), body.get("artist", ""))
-    if not key.strip("|"):
-        return jsonify({"ok": False})
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "json_required"}), 415
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    title, artist = body.get("title", ""), body.get("artist", "")
     src = body.get("source", "auto")
-    off = round(float(body.get("offset", 0)), 1)
+    try:
+        off = round(float(body.get("offset", 0)), 1)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    if (not isinstance(title, str) or not isinstance(artist, str)
+            or len(title) > MAX_TITLE_CHARS or len(artist) > MAX_ARTIST_CHARS
+            or not _valid_source(src) or not math.isfinite(off) or off < -10 or off > 10):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    key = song_key(title, artist)
+    if not key.strip("|"):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
     with _prefs_lock:
         prefs = _load_prefs()
         if src == "auto" and off == 0:
             prefs.pop(key, None)          # reset to default -> drop the record
         else:
+            prefs.pop(key, None)          # move updated record to newest position
             prefs[key] = {"source": src, "offset": off}
+            while len(prefs) > MAX_PREFS_ENTRIES:
+                prefs.pop(next(iter(prefs)))
         _write_prefs(prefs)
     return jsonify({"ok": True})
 
@@ -1420,15 +1959,55 @@ def api_prefs():
 @app.route("/api/report", methods=["POST"])
 def api_report():
     """User-reported lyric problem; appended as one JSON line to REPORTS_FILE."""
-    body = request.get_json(force=True, silent=True) or {}
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "json_required"}), 415
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    title, artist = body.get("title", ""), body.get("artist", "")
+    source, note = body.get("source", ""), body.get("note", "")
+    if (not all(isinstance(x, str) for x in (title, artist, source, note))
+            or len(title) > MAX_TITLE_CHARS or len(artist) > MAX_ARTIST_CHARS
+            or len(source) > MAX_SOURCE_CHARS or len(note) > MAX_REPORT_NOTE_CHARS):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    for key, low, high in (("duration", 0, MAX_DURATION_SECONDS),
+                           ("offset", -10, 10), ("lineCount", 0, 10000)):
+        value = body.get(key)
+        if value is not None:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": "invalid_input"}), 400
+            if not math.isfinite(value) or value < low or value > high:
+                return jsonify({"ok": False, "error": "invalid_input"}), 400
+    if body.get("found") is not None and not isinstance(body.get("found"), bool):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    # Reports are local listening-history records and intentionally omit client
+    # and network identifiers.
     rec = {"ts": round(time.time()), "when": time.strftime("%Y-%m-%d %H:%M:%S")}
     for k in ("title", "artist", "duration", "source", "found", "lineCount", "offset", "note"):
         rec[k] = body.get(k)
     try:
-        with open(REPORTS_FILE, "a") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 500
+        encoded = json.dumps(rec, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with _reports_lock:
+            current_size = os.path.getsize(REPORTS_FILE) if os.path.exists(REPORTS_FILE) else 0
+            if current_size + len(encoded.encode()) > MAX_REPORT_BYTES:
+                rotated = REPORTS_FILE + ".1"
+                if os.path.exists(rotated):
+                    os.unlink(rotated)
+                if os.path.exists(REPORTS_FILE):
+                    os.replace(REPORTS_FILE, rotated)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(REPORTS_FILE, flags, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(encoded)
+                f.flush()
+                os.fsync(f.fileno())
+    except Exception:
+        app.logger.exception("report write failed")
+        return jsonify({"ok": False, "error": "storage_unavailable"}), 500
     return jsonify({"ok": True})
 
 
@@ -1545,7 +2124,9 @@ body{background:var(--page-bg);color:var(--fg);
   </span>
 </div>
 <script>
-const STEP = 0.5, LEAD = 0.6;  // LEAD = global latency compensation (s)
+const STEP = 0.5, LEAD = 0.6, SEEK_BACK_S = 5.0;
+// LEAD compensates normal display latency. Smaller backward clock corrections
+// are accepted, but the visible lyric line waits for playback to catch up.
 const QS = new URLSearchParams(location.search);
 const MOCK = QS.has("mock");
 const MOCK_ENGLISH = QS.has("eng");
@@ -1554,29 +2135,74 @@ const MOCK_DURATION = 270;
 const MOCK_LINES = [[5,"示例歌词第一行"],[11,"示例歌词第二行"],[17,"A neutral demo lyric"],[23,"タイミング表示のサンプル"],[31,"示例歌词第五行"],[37,"Another placeholder line"],[45,"仅用于界面与同步测试"],[51,"No real song text is bundled"]];
 let st=null, base={elapsed:0,at:0,playing:false};
 let lyrics=[], curKey="", curIdx=-1;
+let allowLyricRewind=false, lastStateTs=NaN, pollRequestId=0;
+let songGeneration=0, lyricRequestId=0, candidateRequestId=0, translationRequestId=0;
 let furigana=[], translations=[], showTrans=false, transLoading=false, transKey="";
 let curTitle="", curArtist="", curSource="auto", curOffset=0;
 let lyricInfo={source:"—",found:false,lineCount:0,duration:0,title:"",artist:"",album:""};
 let candidates=[], candLoaded=false, candLoading=false, candFilter="all";
 const $=id=>document.getElementById(id);
 const keyOf=d=>(d.title||"")+"|"+(d.artist||"");
-const sourceName=s=>({musixmatch:"Musixmatch",lrclib:"LRCLIB",netease:"网易云",kugou:"酷狗",plain:"普通歌词",instrumental:"纯音乐",auto:"自动",mock:"Mock"}[(s||"").split(":")[0]]||s||"—");
+const prefStorageKey=(title,artist)=>"tesla-nowplaying:prefs:v1:"+(title||"").trim().toLowerCase()+"|"+(artist||"").trim().toLowerCase();
+function readLocalPref(title,artist){
+  try{ const p=JSON.parse(localStorage.getItem(prefStorageKey(title,artist))||"null");
+    if(p && typeof p.source==="string" && Number.isFinite(+p.offset)) return {source:p.source,offset:Math.max(-10,Math.min(10,+p.offset))};
+  }catch(e){} return null;
+}
+function writeLocalPref(title,artist,source,offset){
+  try{ const k=prefStorageKey(title,artist); if(source==="auto" && +offset===0) localStorage.removeItem(k);
+    else localStorage.setItem(k,JSON.stringify({source,offset:+offset||0})); }catch(e){}
+}
+const sourceName=s=>({musixmatch:"Musixmatch",lrclib:"LRCLIB",petitlyrics:"PetitLyrics",netease:"网易云",kugou:"酷狗",plain:"普通歌词",instrumental:"纯音乐",auto:"自动",mock:"Mock"}[(s||"").split(":")[0]]||s||"—");
 function fmtTime(sec){ sec=Math.max(0,Math.round(+sec||0)); return Math.floor(sec/60)+":"+String(sec%60).padStart(2,"0"); }
 function esc(s){ return String(s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
+function isStaleStateTimestamp(nextTs,previousTs){
+  return Number.isFinite(nextTs) && Number.isFinite(previousTs) && nextTs<=previousTs;
+}
+function shouldAllowLyricRewind(projectedElapsed,incomingElapsed,threshold){
+  return projectedElapsed-incomingElapsed>=threshold;
+}
+function lyricIndexFor(lines,lyricTime,currentIdx,allowBackward){
+  let idx=-1;
+  for(let i=0;i<lines.length;i++){ if(lines[i][0]<=lyricTime) idx=i; else break; }
+  return (!allowBackward && idx<currentIdx) ? currentIdx : idx;
+}
+function clearCurrentSong(){
+  songGeneration+=1; lyricRequestId+=1; candidateRequestId+=1;
+  candLoading=false; candLoaded=false; candFilter="all"; candidates=[]; renderCands();
+  curKey=""; curTitle=""; curArtist=""; allowLyricRewind=false;
+}
+
 async function poll(){
+  const requestId=++pollRequestId;
   try{
     const d = MOCK ? mockState() : await (await fetch("api/state",{cache:"no-store"})).json();
+    if(requestId!==pollRequestId) return;
     if(d.ok && d.online){
-      st=d; base={elapsed:d.elapsed||0, at:performance.now()/1000, playing:!!d.playing};
+      const now=performance.now()/1000, k=keyOf(d), sameSong=!!d.title && k===curKey;
+      const incomingElapsed=typeof d.elapsed==="number" ? d.elapsed : NaN;
+      const validElapsed=Number.isFinite(incomingElapsed) && incomingElapsed>=0;
+      const nextStateTs=typeof d.ts==="number" ? d.ts : NaN;
+      if(isStaleStateTimestamp(nextStateTs,lastStateTs)) return;
+      const projectedElapsed=base.elapsed+(base.playing ? now-base.at : 0);
+      st=d;
+      const anchorElapsed=validElapsed ? incomingElapsed : (sameSong ? projectedElapsed : 0);
+      if(sameSong && shouldAllowLyricRewind(projectedElapsed,anchorElapsed,SEEK_BACK_S))
+        allowLyricRewind=true;
+      base={elapsed:anchorElapsed,at:now,playing:!!d.playing};
+      if(Number.isFinite(nextStateTs)) lastStateTs=nextStateTs;
       $("title").textContent = (MOCK ? "🧪 " : "") + (d.title || (d.status==="Stopped"?"未在播放":"—"));
       $("meta").textContent = [d.artist,d.album].filter(Boolean).join("  ·  ");
       lyricInfo={...lyricInfo,title:d.title||"",artist:d.artist||"",album:d.album||"",duration:d.duration||0}; updateInfo();
-      const k=keyOf(d);
-      if(d.title && k!==curKey){ curKey=k; curTitle=d.title; curArtist=d.artist; onNewSong(d); }
-      if(!d.title){ setLyrics([]); showHint("未在播放音乐"); }
+      if(d.title && k!==curKey){
+        curKey=k; curTitle=d.title; curArtist=d.artist||"";
+        const generation=++songGeneration;
+        onNewSong(d,generation);
+      }
+      if(!d.title){ clearCurrentSong(); setLyrics([]); showHint("未在播放音乐"); }
     } else if(d.ok && !d.online){
-      st=null; $("title").textContent="—"; $("meta").textContent=""; setLyrics([]);
+      st=null; clearCurrentSong(); $("title").textContent="—"; $("meta").textContent=""; setLyrics([]);
       showHint("车辆休眠中 — 开始播放后自动显示");
     } else { showHint("读取失败: "+(d.error||"?")); }
   }catch(e){}
@@ -1587,14 +2213,22 @@ function mockState(){
   return {ok:true,online:true,playing:true,status:"Playing",title:MOCK_ENGLISH?"Demo Song":"示例歌曲",artist:"示例歌手",album:"演示专辑",source:"Mock Player",elapsed,duration:MOCK_DURATION,ts:Date.now()/1000};
 }
 
-async function onNewSong(d){
-  setLyrics([]); candidates=[]; candLoaded=false; candLoading=false; candFilter="all"; showHint("加载歌词…");
-  try{
-    const p = await (await fetch("api/prefs?"+new URLSearchParams({title:d.title,artist:d.artist||""}),{cache:"no-store"})).json();
-    curSource = p.source||"auto"; curOffset = +p.offset||0;
-  }catch(e){ curSource="auto"; curOffset=0; }
+async function onNewSong(d,generation){
+  candidateRequestId+=1;
+  setLyrics([]); candidates=[]; candLoaded=false; candLoading=false; candFilter="all";
+  renderCands(); showHint("加载歌词…");
+  let p=readLocalPref(d.title,d.artist||"");
+  if(!p){
+    // One-time migration of the former server-side preference into this browser.
+    try{ p=await (await fetch("api/prefs?"+new URLSearchParams({title:d.title,artist:d.artist||""}),{cache:"no-store"})).json();
+      if(p && ((p.source||"auto")!=="auto" || (+p.offset||0)!==0)) writeLocalPref(d.title,d.artist||"",p.source||"auto",+p.offset||0);
+    }catch(e){ p=null; }
+  }
+  if(generation!==songGeneration || keyOf(d)!==curKey) return;
+  curSource = (p&&p.source)||"auto"; curOffset = +(p&&p.offset)||0;
   updateCtl();
   await loadLyrics();
+  if(generation!==songGeneration || keyOf(d)!==curKey) return;
   // Candidate list resets on song change; refetch only if the source popup is open.
   renderCands();
   if($("srcpanel") && $("srcpanel").classList.contains("show")) loadCandidates();
@@ -1602,44 +2236,57 @@ async function onNewSong(d){
 
 async function loadCandidates(){
   if(!curTitle) return;
+  const requestId=++candidateRequestId, generation=songGeneration, requestKey=curKey;
+  const requestTitle=curTitle, requestArtist=curArtist||"";
+  const requestDuration=Math.round((st&&st.duration)||0);
   candLoading=true; candLoaded=false; renderCands();   // show "正在查找…" immediately
+  let nextCandidates=[];
   try{
-    const q=new URLSearchParams({title:curTitle,artist:curArtist||"",duration:Math.round((st&&st.duration)||0)});
+    const q=new URLSearchParams({title:requestTitle,artist:requestArtist,duration:requestDuration});
     const j = await (await fetch("api/candidates?"+q,{cache:"no-store"})).json();
-    candidates = (j.ok && j.candidates) ? j.candidates : [];
-  }catch(e){ candidates=[]; }
+    nextCandidates = (j.ok && j.candidates) ? j.candidates : [];
+  }catch(e){}
+  if(requestId!==candidateRequestId || generation!==songGeneration || requestKey!==curKey) return;
+  candidates=nextCandidates;
   candLoading=false; candLoaded=true; renderCands();    // show results or "没有找到可选歌词"
 }
 
 async function loadLyrics(){
+  const requestId=++lyricRequestId;
+  const requestKey=curKey, requestTitle=curTitle, requestArtist=curArtist||"";
+  const requestSource=curSource, requestDuration=Math.round((st&&st.duration)||0);
+  if(MOCK){
+    if(requestId!==lyricRequestId || requestKey!==curKey) return;
+    lyricInfo={...lyricInfo,source:"mock",found:true,lineCount:MOCK_LINES.length,duration:MOCK_DURATION}; updateInfo();
+    setLyrics(MOCK_LINES, null, true); $("realsrc").textContent="· Mock";
+    if(showTrans) loadTranslations();
+    return;
+  }
   try{
-    const q=new URLSearchParams({title:curTitle,artist:curArtist||"",duration:Math.round((st&&st.duration)||0),source:curSource});
+    const q=new URLSearchParams({title:requestTitle,artist:requestArtist,duration:requestDuration,source:requestSource});
     const j = await (await fetch("api/lyrics?"+q,{cache:"no-store"})).json();
+    if(requestId!==lyricRequestId || requestKey!==curKey || requestSource!==curSource) return;
     if(j.ok && j.found){
-      lyricInfo={...lyricInfo,source:j.source||"—",found:true,lineCount:(j.lines||[]).length,duration:(st&&st.duration)||0}; updateInfo();
+      lyricInfo={...lyricInfo,source:j.source||"—",found:true,lineCount:(j.lines||[]).length,duration:requestDuration}; updateInfo();
       setLyrics(j.lines, j.furigana, j.translatable); $("realsrc").textContent = j.source?("· "+sourceName(j.source)):"";
       if(showTrans && j.translatable!==false) loadTranslations();
     }
-    else if(j.instrumental){ lyricInfo={...lyricInfo,source:"instrumental",found:false,lineCount:0,duration:(st&&st.duration)||0}; updateInfo(); setLyrics([]); showHint("🎵 纯音乐 · 无歌词"); $("realsrc").textContent="· 纯音乐"; }
-    else { lyricInfo={...lyricInfo,source:"—",found:false,lineCount:0,duration:(st&&st.duration)||0}; updateInfo(); setLyrics([]); showHint("未找到这首歌的歌词"); $("realsrc").textContent=""; }
+    else if(j.instrumental){ lyricInfo={...lyricInfo,source:"instrumental",found:false,lineCount:0,duration:requestDuration}; updateInfo(); setLyrics([]); showHint("🎵 纯音乐 · 无歌词"); $("realsrc").textContent="· 纯音乐"; }
+    else { lyricInfo={...lyricInfo,source:"—",found:false,lineCount:0,duration:requestDuration}; updateInfo(); setLyrics([]); showHint("未找到这首歌的歌词"); $("realsrc").textContent=""; }
   }catch(e){
-    if(MOCK){
-      lyricInfo={...lyricInfo,source:"mock",found:true,lineCount:MOCK_LINES.length,duration:MOCK_DURATION}; updateInfo();
-      setLyrics(MOCK_LINES, null, true); $("realsrc").textContent = "· Mock fallback";
-      if(showTrans) loadTranslations();
-    } else {
-      lyricInfo={...lyricInfo,source:"—",found:false,lineCount:0,duration:(st&&st.duration)||0}; updateInfo(); setLyrics([]); showHint("歌词加载失败");
-    }
+    if(requestId!==lyricRequestId || requestKey!==curKey || requestSource!==curSource) return;
+    lyricInfo={...lyricInfo,source:"—",found:false,lineCount:0,duration:requestDuration}; updateInfo(); setLyrics([]); showHint("歌词加载失败");
   }
 }
 
 function showHint(t){ $("hint").textContent=t; $("hint").style.display="flex"; }
 function setLyrics(lines, furi, translatable){
-  lyrics=lines||[]; furigana=furi||[]; translations=[]; transKey=""; curIdx=-1;
+  translationRequestId+=1; transLoading=false;
+  lyrics=lines||[]; furigana=furi||[]; translations=[]; transKey=""; curIdx=-1; allowLyricRewind=false;
   // Furigana is always shown when available (no toggle). The 翻译 button only
   // appears for tracks worth translating — Chinese lyrics report translatable=false.
   const tb=$("trbtn"); if(tb){ tb.style.display = (lyrics.length && translatable!==false) ? "" : "none";
-    tb.classList.toggle("on", showTrans && lyrics.length>0); }
+    tb.textContent="翻译"; tb.classList.toggle("on", showTrans && lyrics.length>0); }
   const sc=$("scroll"); sc.innerHTML="";
   if(!lyrics.length) return;
   $("hint").style.display="none";
@@ -1667,16 +2314,21 @@ function renderLines(){
 }
 async function loadTranslations(){
   if(!lyrics.length || transLoading) return;
+  const requestId=++translationRequestId, generation=songGeneration, requestKey=curKey;
+  const requestLines=lyrics.map(l=>l[1]||""), requestTitle=curTitle;
+  const requestArtist=curArtist, requestSource=lyricInfo.source;
   transLoading=true; const b=$("trbtn"); if(b){ b.classList.add("on"); b.textContent="翻译中…"; }
+  let nextTranslations=[];
   try{
-    if(MOCK){ translations = lyrics.map(l=>"译: "+(l[1]||"")); }
+    if(MOCK){ nextTranslations = requestLines.map(line=>"译: "+line); }
     else{
       const r = await (await fetch("api/translate",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({lines:lyrics.map(l=>l[1]||""),title:curTitle,artist:curArtist,source:lyricInfo.source})})).json();
-      translations = (r.ok && r.trans) ? r.trans : [];
+        body:JSON.stringify({lines:requestLines,title:requestTitle,artist:requestArtist,source:requestSource})})).json();
+      nextTranslations = (r.ok && r.trans) ? r.trans : [];
     }
-    transKey=curKey;
-  }catch(e){ translations=[]; }
+  }catch(e){}
+  if(requestId!==translationRequestId || generation!==songGeneration || requestKey!==curKey) return;
+  translations=nextTranslations; transKey=requestKey;
   transLoading=false; if(b){ b.textContent="翻译"; b.classList.toggle("on", showTrans); }
   renderLines();
 }
@@ -1690,8 +2342,13 @@ function tick(){
   if(st && lyrics.length){
     let el = base.elapsed + (base.playing ? performance.now()/1000-base.at : 0) - curOffset;
     if(st.duration) $("barfill").style.width = (100*Math.min(Math.max(el+curOffset,0),st.duration)/st.duration)+"%";
-    let idx=-1; for(let i=0;i<lyrics.length;i++){ if(lyrics[i][0]<=el+LEAD) idx=i; else break; }
-    if(idx<0){ centerLine(0); }
+    const canRewind=allowLyricRewind; allowLyricRewind=false;
+    const idx=lyricIndexFor(lyrics,el+LEAD,curIdx,canRewind);
+    if(idx<0){
+      const n=$("scroll").children;
+      if(curIdx>=0&&n[curIdx]) n[curIdx].classList.remove("cur");
+      curIdx=-1; centerLine(0);
+    }
     else if(idx!==curIdx){
       const n=$("scroll").children;
       if(curIdx>=0&&n[curIdx]) n[curIdx].classList.remove("cur");
@@ -1709,10 +2366,7 @@ function updateCtl(){
 
 function infoSkeleton(){
   if(!$("infopanel") || $("infohead")) return;
-  $("infopanel").innerHTML =
-    `<div id="infohead"></div>`+
-    `<button id="reportbtn">⚠️ 上报歌词有误</button><span id="reportmsg"></span>`;
-  $("reportbtn").onclick=sendReport;
+  $("infopanel").innerHTML = `<div id="infohead"></div>`;
 }
 function srcSkeleton(){
   if(!$("srcpanel") || $("candwrap")) return;
@@ -1753,7 +2407,7 @@ function renderCands(){
   $("candwrap").innerHTML = list.length ? list.map(c=>
     `<button class="cand${curSource===c.id?' on':''}" data-id="${esc(c.id)}">`+
     `<b>${esc(sourceName(c.source))}</b> · ${esc(c.title||'—')}<br>`+
-    `<span class="dim">${esc(c.artist||'—')} · ${esc(c.album||'—')} · ${fmtTime(c.duration)} · 相关度 ${c.score||0}</span>`+
+    `<span class="dim">${esc(c.artist||'—')} · ${esc(c.album||'—')} · ${fmtTime(c.duration)} · 相关度 ${esc(Number.isFinite(Number(c.score)) ? Number(c.score) : 0)}</span>`+
     `</button>`).join("")
     : candLoading ? `<div class="dim status">正在查找候选歌词…</div>`
     : candLoaded ? `<div class="dim status">没有找到可选歌词</div>`
@@ -1761,31 +2415,18 @@ function renderCands(){
   for(const b of $("candwrap").querySelectorAll(".cand")) b.onclick=(e)=>{ e.stopPropagation(); selectCandidate(b.dataset.id); };
 }
 
-async function sendReport(){
-  if(!curTitle) return;
-  const msg=$("reportmsg"); if(msg) msg.textContent="上报中…";
-  try{
-    const r = await fetch("api/report",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({title:curTitle,artist:curArtist||"",duration:Math.round((st&&st.duration)||0),
-        source:lyricInfo.source,found:!!lyricInfo.found,lineCount:lyricInfo.lineCount||0,offset:curOffset})});
-    if(msg) msg.textContent = r.ok ? "已上报 ✓ 谢谢反馈" : "上报失败，请稍后再试";
-  }catch(e){ if(msg) msg.textContent="上报失败，请稍后再试"; }
-}
-
 async function selectCandidate(id){
   if(!id || id==="mock") return;
   curSource=id; updateCtl(); savePrefs(); $("srcpanel").classList.remove("show"); showHint("加载选择的歌词…"); await loadLyrics();
 }
-async function savePrefs(){
-  if(!curTitle) return;
-  try{ await fetch("api/prefs",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({title:curTitle,artist:curArtist,source:curSource,offset:curOffset})}); }catch(e){}
+function savePrefs(){
+  if(curTitle) writeLocalPref(curTitle,curArtist,curSource,curOffset);
 }
 $("infobtn").onclick=()=>{ const show=$("infopanel").classList.toggle("show"); if(show){ if($("srcpanel"))$("srcpanel").classList.remove("show"); updateInfo(); } };
 $("srcbtn").onclick=()=>{ const show=$("srcpanel").classList.toggle("show"); if(show){ if($("infopanel"))$("infopanel").classList.remove("show"); if(!candLoaded && !candLoading && curTitle) loadCandidates(); else renderCands(); } };
 document.addEventListener("click",e=>{ if(!e.target.closest(".info")){ if($("infopanel"))$("infopanel").classList.remove("show"); if($("srcpanel"))$("srcpanel").classList.remove("show"); } });
-$("om").onclick=()=>{ curOffset=Math.max(-10,Math.round((curOffset-STEP)*10)/10); updateCtl(); savePrefs(); };
-$("op").onclick=()=>{ curOffset=Math.min(10,Math.round((curOffset+STEP)*10)/10); updateCtl(); savePrefs(); };
+$("om").onclick=()=>{ curOffset=Math.max(-10,Math.round((curOffset-STEP)*10)/10); allowLyricRewind=true; updateCtl(); savePrefs(); };
+$("op").onclick=()=>{ curOffset=Math.min(10,Math.round((curOffset+STEP)*10)/10); allowLyricRewind=true; updateCtl(); savePrefs(); };
 $("trbtn").onclick=()=>{ showTrans=!showTrans; $("trbtn").classList.toggle("on", showTrans);
   if(showTrans && (transKey!==curKey || !translations.length)) loadTranslations(); else renderLines(); };
 

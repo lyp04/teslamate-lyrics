@@ -1,0 +1,25 @@
+# Tesla "now playing + synced lyrics" page.
+# Reads the current Tesla Owner API access token from TeslaMate's encrypted DB,
+# so it keeps no separate Tesla refresh token. All configuration lives in .env
+# (copy .env.example -> .env). Published on 127.0.0.1 by default — put a reverse
+# proxy + authentication in front of it for any remote access.
+services:
+  nowplaying:
+    build: .
+    container_name: tesla-nowplaying
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    ports:
+      - "${HTTP_BIND_ADDR:-127.0.0.1}:${HTTP_PORT:-8475}:8475"
+    networks:
+      - default
+      - teslamate
+
+networks:
+  # TeslaMate's existing docker network — lets us reach its Postgres by hostname.
+  teslamate:
+    external: true
+    name: ${TESLAMATE_NETWORK:-teslamate_default}

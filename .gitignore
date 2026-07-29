@@ -1,0 +1,18 @@
+# Secrets & live config — never commit
+.env
+teslamate.env
+
+# Runtime data (tokens, prefs, reports, oauth state, verify harness)
+data/
+oauth_state
+
+# Legacy host-specific operational script (Fleet API token grabber)
+grab.sh
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Backups / scratch
+*.bak
+*.bak.*

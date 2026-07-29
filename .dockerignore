@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+teslamate.env
+data/
+oauth_state
+grab.sh
+.venv/
+tests/
+*.log
+*.jsonl
+.git/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.bak*

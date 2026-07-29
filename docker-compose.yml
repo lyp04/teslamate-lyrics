@@ -1,17 +1,51 @@
-# Tesla "now playing + synced lyrics" page.
-# Reads the current Tesla Owner API access token from TeslaMate's encrypted DB,
-# so it keeps no separate Tesla refresh token. All configuration lives in .env
-# (copy .env.example -> .env). Published on 127.0.0.1 by default — put a reverse
-# proxy + authentication in front of it for any remote access.
 services:
   nowplaying:
-    build: .
+    build:
+      context: .
     container_name: tesla-nowplaying
     restart: unless-stopped
+    init: true
+    stop_grace_period: 70s
+    user: "10001:10001"
+    read_only: true
     env_file:
       - .env
     volumes:
-      - ./data:/data
+      - ./data:/data:rw
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    privileged: false
+    cpus: "1.0"
+    mem_limit: 512m
+    mem_reservation: 128m
+    memswap_limit: 512m
+    pids_limit: 64
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 4096
+    shm_size: 16m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request; assert urllib.request.urlopen(
+          'http://127.0.0.1:8475/healthz', timeout=3).read() == b'ok'
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     ports:
       - "${HTTP_BIND_ADDR:-127.0.0.1}:${HTTP_PORT:-8475}:8475"
     networks:
@@ -19,7 +53,6 @@ services:
       - teslamate
 
 networks:
-  # TeslaMate's existing docker network — lets us reach its Postgres by hostname.
   teslamate:
     external: true
     name: ${TESLAMATE_NETWORK:-teslamate_default}

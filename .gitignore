@@ -15,6 +15,16 @@ grab.sh
 # Python
 __pycache__/
 *.py[cod]
+.venv/
+venv/
+
+# Database dumps and key material that tend to appear next to a live deployment
+*.dump
+*.sql
+*.pem
+*.key
+
+.DS_Store
 
 # Backups / scratch
 *.bak

@@ -394,5 +394,4 @@ public issue.
 MIT licensed. Not affiliated with Tesla or TeslaMate. Tesla APIs and lyric
 providers may change without notice and may have their own terms of service.
 
-Built with help from AI-assisted development tools. Contributions and focused pull
-requests are welcome.
+Contributions and focused pull requests are welcome.

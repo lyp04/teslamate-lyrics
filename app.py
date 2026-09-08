@@ -2135,15 +2135,27 @@ const MOCK_DURATION = 270;
 const MOCK_LINES = [[5,"示例歌词第一行"],[11,"示例歌词第二行"],[17,"A neutral demo lyric"],[23,"タイミング表示のサンプル"],[31,"示例歌词第五行"],[37,"Another placeholder line"],[45,"仅用于界面与同步测试"],[51,"No real song text is bundled"]];
 let st=null, base={elapsed:0,at:0,playing:false};
 let lyrics=[], curKey="", curIdx=-1;
-let allowLyricRewind=false, lastStateTs=NaN, pollRequestId=0;
+let allowLyricRewind=false, lastStateTs=NaN, pollRequestId=0, stateFailures=0;
 let songGeneration=0, lyricRequestId=0, candidateRequestId=0, translationRequestId=0;
 let furigana=[], translations=[], showTrans=false, transLoading=false, transKey="";
 let curTitle="", curArtist="", curSource="auto", curOffset=0;
 let lyricInfo={source:"—",found:false,lineCount:0,duration:0,title:"",artist:"",album:""};
-let candidates=[], candLoaded=false, candLoading=false, candFilter="all";
+let candidates=[], candLoaded=false, candLoading=false, candError=false, candFilter="all";
 const $=id=>document.getElementById(id);
 const keyOf=d=>(d.title||"")+"|"+(d.artist||"");
 const prefStorageKey=(title,artist)=>"tesla-nowplaying:prefs:v1:"+(title||"").trim().toLowerCase()+"|"+(artist||"").trim().toLowerCase();
+
+// Consecutive failed state polls tolerated before the page mentions it.
+const STATE_FAIL_HINT_AFTER=4;
+// Every endpoint answers with JSON, so a non-2xx body is something else entirely:
+// a proxy error page, a rate-limit page, or a redirect to a login form. Reject it
+// here instead of letting response.json() throw inside a caller that only meant to
+// shrug off malformed data.
+async function getJSON(url,opts){
+  const r=await fetch(url,opts);
+  if(!r.ok) throw new Error("HTTP "+r.status);
+  return r.json();
+}
 function readLocalPref(title,artist){
   try{ const p=JSON.parse(localStorage.getItem(prefStorageKey(title,artist))||"null");
     if(p && typeof p.source==="string" && Number.isFinite(+p.offset)) return {source:p.source,offset:Math.max(-10,Math.min(10,+p.offset))};
@@ -2170,15 +2182,16 @@ function lyricIndexFor(lines,lyricTime,currentIdx,allowBackward){
 }
 function clearCurrentSong(){
   songGeneration+=1; lyricRequestId+=1; candidateRequestId+=1;
-  candLoading=false; candLoaded=false; candFilter="all"; candidates=[]; renderCands();
+  candLoading=false; candLoaded=false; candError=false; candFilter="all"; candidates=[]; renderCands();
   curKey=""; curTitle=""; curArtist=""; allowLyricRewind=false;
 }
 
 async function poll(){
   const requestId=++pollRequestId;
   try{
-    const d = MOCK ? mockState() : await (await fetch("api/state",{cache:"no-store"})).json();
+    const d = MOCK ? mockState() : await getJSON("api/state",{cache:"no-store"});
     if(requestId!==pollRequestId) return;
+    stateFailures=0;
     if(d.ok && d.online){
       const now=performance.now()/1000, k=keyOf(d), sameSong=!!d.title && k===curKey;
       const incomingElapsed=typeof d.elapsed==="number" ? d.elapsed : NaN;
@@ -2205,7 +2218,15 @@ async function poll(){
       st=null; clearCurrentSong(); $("title").textContent="—"; $("meta").textContent=""; setLyrics([]);
       showHint("车辆休眠中 — 开始播放后自动显示");
     } else { showHint("读取失败: "+(d.error||"?")); }
-  }catch(e){}
+  }catch(e){
+    if(requestId!==pollRequestId) return;
+    stateFailures+=1;
+    // Say what went wrong rather than leaving the previous hint on screen. Before the
+    // first successful poll that hint is the "waiting for playback" placeholder, which
+    // reads as an idle car instead of a failing request. A blip or two is tolerated
+    // first: lyrics keep scrolling on the local clock and there is nothing to act on.
+    if(!st || stateFailures>=STATE_FAIL_HINT_AFTER) showHint("状态读取失败: "+((e&&e.message)||e));
+  }
 }
 
 function mockState(){
@@ -2220,7 +2241,7 @@ async function onNewSong(d,generation){
   let p=readLocalPref(d.title,d.artist||"");
   if(!p){
     // One-time migration of the former server-side preference into this browser.
-    try{ p=await (await fetch("api/prefs?"+new URLSearchParams({title:d.title,artist:d.artist||""}),{cache:"no-store"})).json();
+    try{ p=await getJSON("api/prefs?"+new URLSearchParams({title:d.title,artist:d.artist||""}),{cache:"no-store"});
       if(p && ((p.source||"auto")!=="auto" || (+p.offset||0)!==0)) writeLocalPref(d.title,d.artist||"",p.source||"auto",+p.offset||0);
     }catch(e){ p=null; }
   }
@@ -2239,15 +2260,15 @@ async function loadCandidates(){
   const requestId=++candidateRequestId, generation=songGeneration, requestKey=curKey;
   const requestTitle=curTitle, requestArtist=curArtist||"";
   const requestDuration=Math.round((st&&st.duration)||0);
-  candLoading=true; candLoaded=false; renderCands();   // show "正在查找…" immediately
-  let nextCandidates=[];
+  candLoading=true; candLoaded=false; candError=false; renderCands();   // show "正在查找…" immediately
+  let nextCandidates=[], nextCandError=false;
   try{
     const q=new URLSearchParams({title:requestTitle,artist:requestArtist,duration:requestDuration});
-    const j = await (await fetch("api/candidates?"+q,{cache:"no-store"})).json();
+    const j = await getJSON("api/candidates?"+q,{cache:"no-store"});
     nextCandidates = (j.ok && j.candidates) ? j.candidates : [];
-  }catch(e){}
+  }catch(e){ nextCandError=true; }
   if(requestId!==candidateRequestId || generation!==songGeneration || requestKey!==curKey) return;
-  candidates=nextCandidates;
+  candidates=nextCandidates; candError=nextCandError;
   candLoading=false; candLoaded=true; renderCands();    // show results or "没有找到可选歌词"
 }
 
@@ -2264,7 +2285,7 @@ async function loadLyrics(){
   }
   try{
     const q=new URLSearchParams({title:requestTitle,artist:requestArtist,duration:requestDuration,source:requestSource});
-    const j = await (await fetch("api/lyrics?"+q,{cache:"no-store"})).json();
+    const j = await getJSON("api/lyrics?"+q,{cache:"no-store"});
     if(requestId!==lyricRequestId || requestKey!==curKey || requestSource!==curSource) return;
     if(j.ok && j.found){
       lyricInfo={...lyricInfo,source:j.source||"—",found:true,lineCount:(j.lines||[]).length,duration:requestDuration}; updateInfo();
@@ -2322,8 +2343,8 @@ async function loadTranslations(){
   try{
     if(MOCK){ nextTranslations = requestLines.map(line=>"译: "+line); }
     else{
-      const r = await (await fetch("api/translate",{method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({lines:requestLines,title:requestTitle,artist:requestArtist,source:requestSource})})).json();
+      const r = await getJSON("api/translate",{method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({lines:requestLines,title:requestTitle,artist:requestArtist,source:requestSource})});
       nextTranslations = (r.ok && r.trans) ? r.trans : [];
     }
   }catch(e){}
@@ -2410,6 +2431,7 @@ function renderCands(){
     `<span class="dim">${esc(c.artist||'—')} · ${esc(c.album||'—')} · ${fmtTime(c.duration)} · 相关度 ${esc(Number.isFinite(Number(c.score)) ? Number(c.score) : 0)}</span>`+
     `</button>`).join("")
     : candLoading ? `<div class="dim status">正在查找候选歌词…</div>`
+    : candError ? `<div class="dim status">候选歌词加载失败</div>`
     : candLoaded ? `<div class="dim status">没有找到可选歌词</div>`
     : `<div class="dim status">展开以查找</div>`;
   for(const b of $("candwrap").querySelectorAll(".cand")) b.onclick=(e)=>{ e.stopPropagation(); selectCandidate(b.dataset.id); };

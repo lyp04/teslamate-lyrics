@@ -95,9 +95,9 @@ async function runBrowserIntegration() {
   let responseState = null;
   let fetchImpl = async (url) => {
     const target = String(url);
-    if (target === "api/state") return {json: async () => responseState};
+    if (target === "api/state") return {ok: true, json: async () => responseState};
     if (target.startsWith("api/prefs?")) {
-      return {json: async () => ({source: "auto", offset: 0})};
+      return {ok: true, json: async () => ({source: "auto", offset: 0})};
     }
     throw new Error(`unexpected request: ${target}`);
   };
@@ -185,10 +185,10 @@ async function runBrowserIntegration() {
   };
   const oldPoll = context.poll();
   const newPoll = context.poll();
-  resolveNew({json: async () => ({ok: true, online: true, title: "Newest", artist: "Artist",
+  resolveNew({ok: true, json: async () => ({ok: true, online: true, title: "Newest", artist: "Artist",
     duration: 60, elapsed: 8, playing: true, ts: 105})});
   await newPoll;
-  resolveOld({json: async () => ({ok: true, online: false})});
+  resolveOld({ok: true, json: async () => ({ok: true, online: false})});
   await oldPoll;
   assert.equal(run("st.title"), "Newest");
   assert.equal(run("curKey"), "Newest|Artist");
@@ -198,7 +198,7 @@ async function runBrowserIntegration() {
   // recording must therefore start a new lyric generation.
   fetchImpl = async (url) => {
     assert.equal(String(url), "api/state");
-    return {json: async () => responseState};
+    return {ok: true, json: async () => responseState};
   };
   responseState = {ok: true, online: false};
   await context.poll();
@@ -208,6 +208,42 @@ async function runBrowserIntegration() {
   await context.poll();
   assert.equal(run("curKey"), "Newest|Artist");
   assert.equal(context.songLoads.filter((load) => load.title === "Newest").length, 2);
+
+  // Failed state polls have to reach the screen. Before the first success the
+  // placeholder still reads "waiting for playback", which looks like an idle car
+  // rather than a request that never landed.
+  const stateFetch = fetchImpl;
+
+  // A non-2xx reply: a proxy error page or a rate-limit page.
+  fetchImpl = async () => ({ok: false, status: 503, json: async () => ({})});
+  run('st=null; stateFailures=0; document.getElementById("hint").textContent="waiting";');
+  await context.poll();
+  assert.match(getElement("hint").textContent, /503/,
+    "a failed state poll must replace the waiting placeholder");
+
+  // A 200 whose body is HTML - an error page or a login form - so json() rejects.
+  fetchImpl = async () => ({ok: true, json: async () => {
+    throw new SyntaxError("Unexpected token < in JSON at position 0");
+  }});
+  run('st=null; stateFailures=0; document.getElementById("hint").textContent="waiting";');
+  await context.poll();
+  assert.match(getElement("hint").textContent, /JSON/,
+    "a non-JSON body must be reported, not swallowed");
+
+  // With a song already on screen a single blip stays quiet: the lyrics keep
+  // scrolling on the local clock and there is nothing to act on yet.
+  run('st={title:"New",artist:"Artist",duration:60,playing:true}; stateFailures=0;'
+    + ' document.getElementById("hint").textContent="";');
+  await context.poll();
+  assert.equal(getElement("hint").textContent, "",
+    "one failed poll must not interrupt a song that is already playing");
+  const failThreshold = run("STATE_FAIL_HINT_AFTER");
+  for (let i = 1; i < failThreshold; i += 1) await context.poll();
+  assert.match(getElement("hint").textContent, /JSON/,
+    "repeated failures must surface even while a song is on screen");
+
+  fetchImpl = stateFetch;
+  run('stateFailures=0;');
 
   // Fresh small regressions re-anchor the clock but keep the lyric cursor buffered.
   nowMs = 103_000;
@@ -262,12 +298,12 @@ async function runBrowserIntegration() {
     st={title:"Second",artist:"Artist",duration:60,playing:true}; songGeneration+=1;
   `);
   const secondLyrics = context.loadLyrics();
-  resolveSecondLyrics({json: async () => ({
+  resolveSecondLyrics({ok: true, json: async () => ({
     ok: true, found: true, source: "lrclib",
     lines: [[1, "second one"], [2, "second two"], [3, "second three"], [4, "second four"]],
   })});
   await secondLyrics;
-  resolveFirstLyrics({json: async () => ({
+  resolveFirstLyrics({ok: true, json: async () => ({
     ok: true, found: true, source: "lrclib",
     lines: [[1, "first one"], [2, "first two"], [3, "first three"], [4, "first four"]],
   })});
@@ -297,12 +333,12 @@ async function runBrowserIntegration() {
     st={title:"Second",artist:"Artist",duration:60}; songGeneration+=1;
   `);
   const secondCandidates = context.loadCandidates();
-  resolveSecondCandidates({json: async () => ({
+  resolveSecondCandidates({ok: true, json: async () => ({
     ok: true,
     candidates: [{id: "lrclib:second", source: "lrclib", title: "Second", artist: "Artist"}],
   })});
   await secondCandidates;
-  resolveFirstCandidates({json: async () => ({
+  resolveFirstCandidates({ok: true, json: async () => ({
     ok: true,
     candidates: [{id: "lrclib:first", source: "lrclib", title: "First", artist: "Artist"}],
   })});
@@ -332,11 +368,11 @@ async function runBrowserIntegration() {
     setLyrics([[1,"second one"],[2,"second two"],[3,"second three"],[4,"second four"]],[],true);
   `);
   const secondTranslation = context.loadTranslations();
-  resolveSecondTranslation({json: async () => ({
+  resolveSecondTranslation({ok: true, json: async () => ({
     ok: true, trans: ["second translated", "two", "three", "four"],
   })});
   await secondTranslation;
-  resolveFirstTranslation({json: async () => ({
+  resolveFirstTranslation({ok: true, json: async () => ({
     ok: true, trans: ["first translated", "two", "three", "four"],
   })});
   await firstTranslation;

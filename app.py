@@ -502,15 +502,15 @@ def api_state():
 # ---------------- Lyrics providers and matching ----------------
 _TS = re.compile(r"\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?\]")
 _META = re.compile(r"^\[[a-zA-Z]+:")
-_CJK = re.compile(r"[\u4e00-\u9fff]{2,}")
-# Production credit lines (CN / TW / JP / EN) that some sources put inside the LRC \u2014
-# matched as "<role>:<value>"/"<role>\uff1a<value>" so real lyrics aren't dropped.
+_CJK = re.compile(r"[一-鿿]{2,}")
+# Production credit lines (CN / TW / JP / EN) that some sources put inside the LRC —
+# matched as "<role>:<value>"/"<role>：<value>" so real lyrics aren't dropped.
 _CREDIT = re.compile(
-    r"^\s*[^:\uff1a\n]{0,8}?(\u4f5c\s*[\u8bcd\u8a5e]|\u4f5c\s*\u66f2|[\u7f16\u7de8]\s*\u66f2|\u586b\s*[\u8bcd\u8a5e]|[\u8c31\u8b5c]\s*\u66f2|[\u5236\u88fd]\s*\u4f5c(\u4eba)?|[\u76d1\u76e3]\s*[\u5236\u88fd]|\u51fa\u54c1|[\u53d1\u767c]\s*\u884c|"
-    r"\u4f01[\u5212\u5283]|[\u7edf\u7d71]\s*[\u7b79\u7c4c]|\u914d\s*\u5531|\u548c\s*[\u58f0\u8072]|\u5408\s*[\u58f0\u8072]|\u6df7\s*\u97f3|\u6bcd\s*[\u5e26\u5e36]|[\u5f55\u9304]\s*\u97f3|\u6f14\s*\u594f|"
-    r"\u5409\u4ed6|[\u8d1d\u8c9d]\u65af|\u9f13|[\u952e\u9375]\u76d8|[\u94a2\u92fc]\u7434|\u63d0\u7434|[\u957f\u9577]\u7b1b|\u8428\u514b\u65af|\u85a9\u514b\u65af|[\u7f16\u7de8]\u7a0b|[\u7f16\u7de8]\u8f91|[\u5f55\u9304]\u5236|\u5c01\u9762|[\u76d1\u76e3]\u5531|[\u89c6\u8996][\u89c9\u89ba]|\u7f8e[\u672f\u8853]|[\u8425\u71df][\u9500\u92b7]|\u63a8[\u5e7f\u5ee3]|\u5ba3[\u4f20\u50b3]|\u539f\u5531|\u6f14\u5531|\u6587\u6848|[\u7ecf\u7d93][\u7eaa\u7d00]|\u7248[\u6743\u6b0a]|\u51fa\u7248|[\u534f\u5354]\u529b|\u52a9\u7406|\u5de5\u7a0b|[\u540e\u5f8c]\u671f|[\u91c7\u63a1][\u6837\u6a23]|\u5408\u6210|[\u9e23\u9cf4][\u8c22\u8b1d]|\u7b56[\u5212\u5283]|[\u603b\u7e3d][\u76d1\u76e3]|[\u7f29\u7e2e]\u6df7|\u914d\u5668|\u548c\u97f3|[\u5f26\u7ba1][\u4e50\u6a02]|\u5f26[\u4e50\u6a02]|\u6b4c|\u5504|[\u8bcd\u8a5e]|\u66f2|"
+    r"^\s*[^:：\n]{0,8}?(作\s*[词詞]|作\s*曲|[编編]\s*曲|填\s*[词詞]|[谱譜]\s*曲|[制製]\s*作(人)?|[监監]\s*[制製]|出品|[发發]\s*行|"
+    r"企[划劃]|[统統]\s*[筹籌]|配\s*唱|和\s*[声聲]|合\s*[声聲]|混\s*音|母\s*[带帶]|[录錄]\s*音|演\s*奏|"
+    r"吉他|[贝貝]斯|鼓|[键鍵]盘|[钢鋼]琴|提琴|[长長]笛|萨克斯|薩克斯|[编編]程|[编編]辑|[录錄]制|封面|[监監]唱|[视視][觉覺]|美[术術]|[营營][销銷]|推[广廣]|宣[传傳]|原唱|演唱|文案|[经經][纪紀]|版[权權]|出版|[协協]力|助理|工程|[后後]期|[采採][样樣]|合成|[鸣鳴][谢謝]|策[划劃]|[总總][监監]|[缩縮]混|配器|和音|[弦管][乐樂]|弦[乐樂]|歌|唄|[词詞]|曲|"
     r"produc(ed|er|ers|tion)|a\s*&\s*r|engineer(ing|ed)?|artwork|written|composed|arranged|mix(ed|ing)|master(ed|ing)|record(ed|ing)?|studio|"
-    r"lyric(s|ist)?|compos(er|ed)|vocal|guitar|bass|drums|piano|violin|cello|viola|keyboards?|strings|flute|sax|programm(ed|ing)|OP|SP|ISRC)[^:\uff1a\n]{0,10}[:\uff1a]", re.I)
+    r"lyric(s|ist)?|compos(er|ed)|vocal|guitar|bass|drums|piano|violin|cello|viola|keyboards?|strings|flute|sax|programm(ed|ing)|OP|SP|ISRC)[^:：\n]{0,10}[:：]", re.I)
 _BAD_ALIAS = {"原唱", "钢琴", "钢琴曲", "纯音乐", "华语", "流行", "合辑", "音乐", "经典", "热门", "翻唱", "伴奏"}
 # Keep the public tree free of an operator's listening fingerprints. Cross-script
 # aliases and native titles are recovered from provider metadata at runtime.
@@ -637,7 +637,7 @@ def _kana_romaji(s):
 
 
 def _norm_title(s):
-    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", _t2s((s or "").lower()))
+    return re.sub(r"[^a-z0-9一-鿿]+", "", _t2s((s or "").lower()))
 
 
 def title_matches(want, got):
@@ -706,7 +706,7 @@ def search_lrclib(title, artist, duration, limit=5):
 
 
 def _norm_words(s):
-    return set(re.findall(r"[a-z0-9\u4e00-\u9fff]+", (s or "").lower()))
+    return set(re.findall(r"[a-z0-9一-鿿]+", (s or "").lower()))
 
 
 def _candidate_score(title, artist, duration, item, index=0):
@@ -1604,7 +1604,7 @@ except Exception:
 _furi_lock = threading.Lock()
 
 _KANA = re.compile(r"[぀-ヿㇰ-ㇿｦ-ﾟ]")
-_KANJI = re.compile(r"[㐀-䶿一-鿿豈-﫿々〆〇]")
+_KANJI = re.compile(r"[㐀-䶿一-鿿豈-﫿々〆〇]")
 _KATAKANA = re.compile(r"[ァ-ヺヽヾㇰ-ㇿｦ-ﾝ]")
 
 
@@ -2027,89 +2027,102 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <meta name="color-scheme" content="light dark">
 <title>正在播放</title>
 <style>
+/* Shares its look with the in-car menu: same background, surfaces and
+   touch sizes. Controls are sized for a car touchscreen (48px targets). */
 :root{color-scheme:light dark; --accent:#1db954;
- --fg:#f2f3f5; --dim:#878d96; --bg:#0a0c10; --page-bg:radial-gradient(120% 80% at 50% -10%,#161a22 0%,var(--bg) 60%);
- --line:#5b616a; --line-cur:#fff; --panel:rgba(255,255,255,.03); --panel-border:rgba(255,255,255,.06); --bar-bg:rgba(255,255,255,.08);
- --seg-bg:rgba(255,255,255,.06); --button-bg:rgba(255,255,255,.04); --button-border:rgba(255,255,255,.14); --button-active:rgba(255,255,255,.12); --active-fg:#06210f; --note:#4a4f57; --label:#666d77}
-@media (prefers-color-scheme: light){:root{color-scheme:light; --fg:#15171a; --dim:#5d6570; --bg:#f5f7fb; --page-bg:radial-gradient(120% 80% at 50% -10%,#fff 0%,#eef2f8 62%,var(--bg) 100%);
- --line:#a2a9b3; --line-cur:#0d1117; --panel:rgba(0,0,0,.035); --panel-border:rgba(0,0,0,.07); --bar-bg:rgba(0,0,0,.08);
- --seg-bg:rgba(0,0,0,.055); --button-bg:rgba(0,0,0,.035); --button-border:rgba(0,0,0,.13); --button-active:rgba(0,0,0,.10); --active-fg:#fff; --note:#7a828d; --label:#79818c}}
+ --fg:#f3f5f8; --dim:#8d95a3; --bg:#07090d; --page-bg:radial-gradient(120% 90% at 50% -10%,#151a24 0%,var(--bg) 62%);
+ --line:#5b616a; --line-cur:#fff; --panel:rgba(255,255,255,.05); --panel-border:rgba(255,255,255,.09); --bar-bg:rgba(255,255,255,.08);
+ --seg-bg:rgba(255,255,255,.06); --button-bg:rgba(255,255,255,.06); --button-border:rgba(255,255,255,.12); --button-active:rgba(255,255,255,.14); --active-fg:#06210f; --note:#4a4f57; --label:#8d95a3;
+ --pop-bg:#11151c; --ring:#7cc4ff}
+@media (prefers-color-scheme: light){:root{color-scheme:light; --fg:#10141b; --dim:#5b6472; --bg:#eef1f6; --page-bg:radial-gradient(120% 90% at 50% -10%,#fff 0%,var(--bg) 62%);
+ --line:#a2a9b3; --line-cur:#0d1117; --panel:rgba(0,0,0,.04); --panel-border:rgba(0,0,0,.08); --bar-bg:rgba(0,0,0,.08);
+ --seg-bg:rgba(0,0,0,.055); --button-bg:rgba(0,0,0,.04); --button-border:rgba(0,0,0,.12); --button-active:rgba(0,0,0,.10); --active-fg:#fff; --note:#7a828d; --label:#5b6472;
+ --pop-bg:#fff; --ring:#1d6fd6}}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html,body{height:100%}
 body{background:var(--page-bg);color:var(--fg);
- font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+ font-family:-apple-system,"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",system-ui,sans-serif;
  display:flex;flex-direction:column;overflow:hidden}
 #hdr{padding:14px 22px 8px;text-align:center;flex:0 0 auto}
 /* song title / artist / album are intentionally hidden from the top of the page
    (still available in the 「歌词信息」 popup); only the progress bar stays up top. */
 #title,#meta,#realsrc{display:none}
-#bar{height:3px;background:var(--bar-bg);border-radius:3px;margin:14px 32px 0;overflow:hidden}
-#barfill{height:100%;width:0;background:var(--accent);border-radius:3px;transition:width .25s linear}
+#bar{height:4px;background:var(--bar-bg);border-radius:4px;margin:14px 32px 0;overflow:hidden}
+#barfill{height:100%;width:0;background:var(--accent);border-radius:4px;transition:width .25s linear}
 #lyrics{flex:1 1 auto;overflow:hidden;position:relative;
  -webkit-mask-image:linear-gradient(transparent,#000 16%,#000 76%,transparent);
  mask-image:linear-gradient(transparent,#000 16%,#000 76%,transparent)}
 #scroll{position:absolute;left:0;right:0;top:50%;transition:transform .5s cubic-bezier(.22,.7,.16,1);will-change:transform}
-.ln{padding:12px 32px;text-align:left;font-size:clamp(30px,8vw,48px);color:var(--line);line-height:1.25;font-weight:700;
+.ln{padding:12px 48px;text-align:left;font-size:clamp(30px,8vw,48px);color:var(--line);line-height:1.25;font-weight:700;
  transition:color .28s,opacity .28s,transform .28s;opacity:.5;transform-origin:left center}
 .ln.cur{color:var(--line-cur);opacity:1;transform:scale(1.04)}
 #hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;
- color:var(--dim);font-size:15px;padding:30px}
-#ctl{flex:0 0 auto;display:flex;align-items:center;justify-content:center;gap:14px;
- padding:12px 16px calc(12px + env(safe-area-inset-bottom));background:var(--panel);
- border-top:1px solid var(--panel-border);font-size:13px;color:var(--dim);flex-wrap:wrap}
-.seg{display:inline-flex;background:var(--seg-bg);border-radius:9px;overflow:hidden}
-.seg button{background:none;border:0;color:var(--dim);padding:6px 11px;font-size:13px;cursor:pointer}
+ color:var(--dim);font-size:20px;padding:30px}
+#ctl{flex:0 0 auto;position:relative;display:flex;align-items:center;justify-content:center;gap:16px;
+ padding:14px 24px calc(14px + env(safe-area-inset-bottom));background:var(--panel);
+ border-top:1px solid var(--panel-border);font-size:16px;color:var(--dim);flex-wrap:wrap;min-height:76px}
+button,#home{font:inherit}
+button:focus-visible,#home:focus-visible{outline:3px solid var(--ring);outline-offset:2px}
+#home{position:absolute;left:20px;top:50%;transform:translateY(-50%);display:inline-flex;align-items:center;gap:8px;
+ height:48px;padding:0 18px 0 12px;border-radius:14px;border:1px solid var(--button-border);background:var(--button-bg);
+ color:var(--fg);text-decoration:none;font-size:16px;font-weight:600}
+#home svg{width:24px;height:24px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+#home:active{background:var(--button-active)}
+.seg{display:inline-flex;background:var(--seg-bg);border-radius:14px;overflow:hidden}
+.seg button{background:none;border:0;color:var(--dim);min-height:48px;padding:0 16px;font-size:16px;cursor:pointer}
 .seg button.on{background:var(--accent);color:var(--active-fg);font-weight:700}
 .info{position:relative;display:inline-flex}
-.info button{border:1px solid var(--button-border);border-radius:999px;background:var(--button-bg);color:var(--fg);
- padding:7px 13px;font-size:13px;cursor:pointer;min-width:110px;text-align:center}
+.info button{border:1px solid var(--button-border);border-radius:14px;background:var(--button-bg);color:var(--fg);
+ min-height:48px;padding:0 20px;font-size:16px;font-weight:600;cursor:pointer;min-width:128px;text-align:center}
 .info button:active{background:var(--button-active)}
-#infopanel,#srcpanel{display:none;position:absolute;left:0;bottom:42px;min-width:250px;max-width:min(360px,92vw);z-index:4;
- max-height:min(76vh,560px);
- padding:13px 15px;border:1px solid var(--panel-border);border-radius:14px;background:var(--bg);color:var(--fg);
- box-shadow:0 14px 40px rgba(0,0,0,.28);font-size:15px;line-height:1.6;text-align:left}
+#infopanel,#srcpanel{display:none;position:absolute;left:0;bottom:60px;min-width:280px;max-width:min(400px,92vw);z-index:4;
+ max-height:min(76vh,600px);
+ padding:16px 18px;border:1px solid var(--panel-border);border-radius:18px;background:var(--pop-bg);color:var(--fg);
+ box-shadow:0 18px 48px rgba(0,0,0,.4);font-size:16px;line-height:1.6;text-align:left}
 #infopanel.show,#srcpanel.show{display:flex;flex-direction:column}
 #infohead{flex:0 0 auto}
 /* filter chips sit on their own line(s) above the list, free to wrap to two rows */
-#candbar{flex:0 0 auto;margin-bottom:8px}
-#candbar b{display:block;margin-bottom:7px}
-#candfilter{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.fchip{border:1px solid var(--button-border);background:var(--button-bg);color:var(--dim);border-radius:999px;
- padding:6px 12px;font-size:14px;cursor:pointer;line-height:1.4;text-align:center}
+#candbar{flex:0 0 auto;margin-bottom:10px}
+#candbar b{display:block;margin-bottom:8px}
+#candfilter{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.fchip{border:1px solid var(--button-border);background:var(--button-bg);color:var(--dim);border-radius:12px;
+ min-height:44px;padding:0 12px;font-size:15px;cursor:pointer;line-height:1.3;text-align:center}
 .fchip.on{background:var(--accent);color:var(--active-fg);border-color:var(--accent);font-weight:700}
 /* candidate list: scrollable SINGLE column (full-width rows so info isn't cut off) */
 #candwrap{flex:1 1 auto;overflow-y:auto;-webkit-overflow-scrolling:touch;min-height:38px}
 #candwrap .status{padding:6px 2px}
-#reportbtn{flex:0 0 auto;margin-top:10px;width:100%;border:1px solid var(--button-border);background:var(--button-bg);
- color:var(--fg);border-radius:10px;padding:9px 10px;font-size:14px;cursor:pointer}
+#reportbtn{flex:0 0 auto;margin-top:12px;width:100%;border:1px solid var(--button-border);background:var(--button-bg);
+ color:var(--fg);border-radius:14px;min-height:48px;padding:0 12px;font-size:16px;cursor:pointer}
 #reportbtn:active{background:var(--button-active)}
-#reportmsg{flex:0 0 auto;margin-top:5px;color:var(--dim);font-size:12.5px;text-align:center;min-height:14px}
+#reportmsg{flex:0 0 auto;margin-top:6px;color:var(--dim);font-size:13px;text-align:center;min-height:14px}
 #infopanel .dim,#srcpanel .dim{color:var(--dim)}
-.cand{display:block;width:100%;margin:7px 0 0;padding:9px 11px;border:1px solid var(--button-border);border-radius:10px;
- background:var(--button-bg);color:var(--fg);text-align:left;font-size:14px;line-height:1.4;cursor:pointer;word-break:break-word}
+.cand{display:block;width:100%;margin:8px 0 0;padding:12px 14px;border:1px solid var(--button-border);border-radius:14px;
+ background:var(--button-bg);color:var(--fg);text-align:left;font-size:15px;line-height:1.45;cursor:pointer;word-break:break-word}
 .cand.on{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
 .cand:active{background:var(--button-active)}
-.step{display:inline-flex;align-items:center;gap:9px}
-.step button{width:30px;height:30px;border-radius:50%;border:1px solid var(--button-border);
- background:var(--button-bg);color:var(--fg);font-size:17px;cursor:pointer;line-height:1}
+.step{display:inline-flex;align-items:center;gap:10px}
+.step button{width:48px;height:48px;border-radius:50%;border:1px solid var(--button-border);
+ background:var(--button-bg);color:var(--fg);font-size:24px;cursor:pointer;line-height:1}
 .step button:active{background:var(--button-active)}
-#off{min-width:52px;text-align:center;font-variant-numeric:tabular-nums;color:var(--fg)}
-.lbl{color:var(--label);font-size:12px}
+#off{min-width:60px;text-align:center;font-variant-numeric:tabular-nums;color:var(--fg)}
+.lbl{color:var(--label);font-size:14px}
 /* furigana ruby + per-line translation rendered inside each .ln */
 .ln ruby{ruby-position:over;-webkit-ruby-position:over;ruby-align:center}
 .ln rt{font-size:.4em;font-weight:600;color:var(--dim);line-height:1.05;letter-spacing:.01em;
  -webkit-user-select:none;user-select:none}
 .ln .tr{display:block;margin-top:7px;font-size:.46em;font-weight:600;color:var(--dim);line-height:1.25;opacity:.92}
-.tgl{border:1px solid var(--button-border);border-radius:999px;background:var(--button-bg);color:var(--fg);
- padding:7px 14px;font-size:13px;cursor:pointer}
+.tgl{border:1px solid var(--button-border);border-radius:14px;background:var(--button-bg);color:var(--fg);
+ min-height:48px;padding:0 20px;font-size:16px;font-weight:600;cursor:pointer}
 .tgl.on{background:var(--accent);color:var(--active-fg);border-color:var(--accent);font-weight:700}
 .tgl:disabled{opacity:.45;cursor:default}
 .tgl:active{background:var(--button-active)}
+@media (max-width:900px){#home span{display:none}#home{padding:0 12px}}
 </style></head>
 <body>
 <div id="hdr"><div id="title">—</div><div id="meta"></div><div id="bar"><div id="barfill"></div></div></div>
 <div id="lyrics"><div id="scroll"></div><div id="hint">等待车辆播放音乐…</div></div>
 <div id="ctl">
+  <a id="home" href="/" aria-label="返回菜单"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>菜单</span></a>
   <span class="info">
     <button id="infobtn">歌词信息</button>
     <span id="infopanel"></span>

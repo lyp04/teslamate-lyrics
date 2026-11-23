@@ -502,15 +502,15 @@ def api_state():
 # ---------------- Lyrics providers and matching ----------------
 _TS = re.compile(r"\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?\]")
 _META = re.compile(r"^\[[a-zA-Z]+:")
-_CJK = re.compile(r"[\\u4e00-\\u9fff]{2,}")
-# Production credit lines (CN / TW / JP / EN) that some sources put inside the LRC \\u2014
-# matched as "<role>:<value>"/"<role>\\uff1a<value>" so real lyrics aren't dropped.
+_CJK = re.compile(r"[一-鿿]{2,}")
+# Production credit lines (CN / TW / JP / EN) that some sources put inside the LRC —
+# matched as "<role>:<value>"/"<role>：<value>" so real lyrics aren't dropped.
 _CREDIT = re.compile(
-    r"^\s*[^:\\uff1a\n]{0,8}?(\\u4f5c\s*[\\u8bcd\\u8a5e]|\\u4f5c\s*\\u66f2|[\\u7f16\\u7de8]\s*\\u66f2|\\u586b\s*[\\u8bcd\\u8a5e]|[\\u8c31\\u8b5c]\s*\\u66f2|[\\u5236\\u88fd]\s*\\u4f5c(\\u4eba)?|[\\u76d1\\u76e3]\s*[\\u5236\\u88fd]|\\u51fa\\u54c1|[\\u53d1\\u767c]\s*\\u884c|"
-    r"\\u4f01[\\u5212\\u5283]|[\\u7edf\\u7d71]\s*[\\u7b79\\u7c4c]|\\u914d\s*\\u5531|\\u548c\s*[\\u58f0\\u8072]|\\u5408\s*[\\u58f0\\u8072]|\\u6df7\s*\\u97f3|\\u6bcd\s*[\\u5e26\\u5e36]|[\\u5f55\\u9304]\s*\\u97f3|\\u6f14\s*\\u594f|"
-    r"\\u5409\\u4ed6|[\\u8d1d\\u8c9d]\\u65af|\\u9f13|[\\u952e\\u9375]\\u76d8|[\\u94a2\\u92fc]\\u7434|\\u63d0\\u7434|[\\u957f\\u9577]\\u7b1b|\\u8428\\u514b\\u65af|\\u85a9\\u514b\\u65af|[\\u7f16\\u7de8]\\u7a0b|[\\u7f16\\u7de8]\\u8f91|[\\u5f55\\u9304]\\u5236|\\u5c01\\u9762|[\\u76d1\\u76e3]\\u5531|[\\u89c6\\u8996][\\u89c9\\u89ba]|\\u7f8e[\\u672f\\u8853]|[\\u8425\\u71df][\\u9500\\u92b7]|\\u63a8[\\u5e7f\\u5ee3]|\\u5ba3[\\u4f20\\u50b3]|\\u539f\\u5531|\\u6f14\\u5531|\\u6587\\u6848|[\\u7ecf\\u7d93][\\u7eaa\\u7d00]|\\u7248[\\u6743\\u6b0a]|\\u51fa\\u7248|[\\u534f\\u5354]\\u529b|\\u52a9\\u7406|\\u5de5\\u7a0b|[\\u540e\\u5f8c]\\u671f|[\\u91c7\\u63a1][\\u6837\\u6a23]|\\u5408\\u6210|[\\u9e23\\u9cf4][\\u8c22\\u8b1d]|\\u7b56[\\u5212\\u5283]|[\\u603b\\u7e3d][\\u76d1\\u76e3]|[\\u7f29\\u7e2e]\\u6df7|\\u914d\\u5668|\\u548c\\u97f3|[\\u5f26\\u7ba1][\\u4e50\\u6a02]|\\u5f26[\\u4e50\\u6a02]|\\u6b4c|\\u5504|[\\u8bcd\\u8a5e]|\\u66f2|"
+    r"^\s*[^:：\n]{0,8}?(作\s*[词詞]|作\s*曲|[编編]\s*曲|填\s*[词詞]|[谱譜]\s*曲|[制製]\s*作(人)?|[监監]\s*[制製]|出品|[发發]\s*行|"
+    r"企[划劃]|[统統]\s*[筹籌]|配\s*唱|和\s*[声聲]|合\s*[声聲]|混\s*音|母\s*[带帶]|[录錄]\s*音|演\s*奏|"
+    r"吉他|[贝貝]斯|鼓|[键鍵]盘|[钢鋼]琴|提琴|[长長]笛|萨克斯|薩克斯|[编編]程|[编編]辑|[录錄]制|封面|[监監]唱|[视視][觉覺]|美[术術]|[营營][销銷]|推[广廣]|宣[传傳]|原唱|演唱|文案|[经經][纪紀]|版[权權]|出版|[协協]力|助理|工程|[后後]期|[采採][样樣]|合成|[鸣鳴][谢謝]|策[划劃]|[总總][监監]|[缩縮]混|配器|和音|[弦管][乐樂]|弦[乐樂]|歌|唄|[词詞]|曲|"
     r"produc(ed|er|ers|tion)|a\s*&\s*r|engineer(ing|ed)?|artwork|written|composed|arranged|mix(ed|ing)|master(ed|ing)|record(ed|ing)?|studio|"
-    r"lyric(s|ist)?|compos(er|ed)|vocal|guitar|bass|drums|piano|violin|cello|viola|keyboards?|strings|flute|sax|programm(ed|ing)|OP|SP|ISRC)[^:\\uff1a\n]{0,10}[:\\uff1a]", re.I)
+    r"lyric(s|ist)?|compos(er|ed)|vocal|guitar|bass|drums|piano|violin|cello|viola|keyboards?|strings|flute|sax|programm(ed|ing)|OP|SP|ISRC)[^:：\n]{0,10}[:：]", re.I)
 _BAD_ALIAS = {"原唱", "钢琴", "钢琴曲", "纯音乐", "华语", "流行", "合辑", "音乐", "经典", "热门", "翻唱", "伴奏"}
 # Keep the public tree free of an operator's listening fingerprints. Cross-script
 # aliases and native titles are recovered from provider metadata at runtime.
@@ -637,7 +637,7 @@ def _kana_romaji(s):
 
 
 def _norm_title(s):
-    return re.sub(r"[^a-z0-9\\u4e00-\\u9fff]+", "", _t2s((s or "").lower()))
+    return re.sub(r"[^a-z0-9一-鿿]+", "", _t2s((s or "").lower()))
 
 
 def title_matches(want, got):
@@ -706,7 +706,7 @@ def search_lrclib(title, artist, duration, limit=5):
 
 
 def _norm_words(s):
-    return set(re.findall(r"[a-z0-9\\u4e00-\\u9fff]+", (s or "").lower()))
+    return set(re.findall(r"[a-z0-9一-鿿]+", (s or "").lower()))
 
 
 def _candidate_score(title, artist, duration, item, index=0):
@@ -1604,7 +1604,7 @@ except Exception:
 _furi_lock = threading.Lock()
 
 _KANA = re.compile(r"[぀-ヿㇰ-ㇿｦ-ﾟ]")
-_KANJI = re.compile(r"[㐀-䶿一-鿿豈-﫿々〆〇]")
+_KANJI = re.compile(r"[㐀-䶿一-鿿豈-﫿々〆〇]")
 _KATAKANA = re.compile(r"[ァ-ヺヽヾㇰ-ㇿｦ-ﾝ]")
 
 

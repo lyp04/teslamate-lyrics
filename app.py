@@ -1604,7 +1604,7 @@ except Exception:
 _furi_lock = threading.Lock()
 
 _KANA = re.compile(r"[぀-ヿㇰ-ㇿｦ-ﾟ]")
-_KANJI = re.compile(r"[㐀-䶿一-鿿豈-﫿々〆〇]")
+_KANJI = re.compile(r"[㐀-䶿一-鿿豈-﫿々〆〇]")
 _KATAKANA = re.compile(r"[ァ-ヺヽヾㇰ-ㇿｦ-ﾝ]")
 
 

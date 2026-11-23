@@ -34,6 +34,9 @@ or copyrighted demo lyrics are included in this repository.
   previous line.
 - **Per-browser preferences** — remembers the selected lyric source and timing
   offset in browser `localStorage`.
+- **Car-sized controls** — the control bar uses 48px touch targets, follows the
+  car's light/dark mode, and has a **菜单** button linking to the site root (`/`),
+  so the page can sit under a launcher page such as `/music/`.
 - **Local bad-match report API** — an optional endpoint appends bounded feedback
   records to the host's private `data/` directory. Client IP addresses are not
   recorded.

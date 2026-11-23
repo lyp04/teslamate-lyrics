@@ -67,6 +67,7 @@ TESLAMATE_ACCESS_TTL = float(_env("TESLAMATE_ACCESS_TTL", default="60"))
 # Runtime data files (live on the mounted /data volume).
 TOKEN_FILE = _env("TOKEN_FILE", default="/data/token.json")
 PREFS_FILE = _env("PREFS_FILE", default="/data/prefs.json")
+SETTINGS_FILE = _env("SETTINGS_FILE", default="/data/settings.json")
 REPORTS_FILE = _env("REPORTS_FILE", default="/data/reports.jsonl")
 
 # Web server + features.
@@ -1956,6 +1957,44 @@ def api_prefs():
     return jsonify({"ok": True})
 
 
+# ---------------- Global settings: one lyric offset added to every song ----
+GLOBAL_OFFSET_LIMIT = 5.0
+
+
+def _load_settings():
+    try:
+        with open(SETTINGS_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+@app.route("/api/settings", methods=["GET", "POST"])
+def api_settings():
+    if request.method == "GET":
+        off = _load_settings().get("globalOffset", 0)
+        if not isinstance(off, (int, float)) or not math.isfinite(off):
+            off = 0
+        return jsonify({"globalOffset": off})
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "json_required"}), 415
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    try:
+        off = round(float(body.get("globalOffset", 0)), 1)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    if not math.isfinite(off) or abs(off) > GLOBAL_OFFSET_LIMIT:
+        return jsonify({"ok": False, "error": "invalid_input"}), 400
+    with _prefs_lock:
+        settings = _load_settings()
+        settings["globalOffset"] = off
+        _atomic_write_json(SETTINGS_FILE, settings)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/report", methods=["POST"])
 def api_report():
     """User-reported lyric problem; appended as one JSON line to REPORTS_FILE."""
@@ -2081,6 +2120,12 @@ button:focus-visible,#home:focus-visible{outline:3px solid var(--ring);outline-o
  box-shadow:0 18px 48px rgba(0,0,0,.4);font-size:16px;line-height:1.6;text-align:left}
 #infopanel.show,#srcpanel.show{display:flex;flex-direction:column}
 #infohead{flex:0 0 auto}
+#gstep{flex:0 0 auto;margin-top:12px;padding-top:12px;border-top:1px solid var(--panel-border)}
+#gstep .row{display:flex;align-items:center;gap:10px}
+#gstep .row .lbl{flex:1 1 auto;font-size:16px;color:var(--fg);white-space:nowrap}
+#gstep .row button{flex:0 0 auto;width:48px;height:48px;min-width:0;min-height:0;padding:0;border-radius:50%;font-size:22px;font-weight:400}
+#gstep #goff{flex:0 0 auto;min-width:60px;text-align:center;font-variant-numeric:tabular-nums}
+#gstep .hint{margin-top:4px;font-size:13px;color:var(--dim)}
 /* filter chips sit on their own line(s) above the list, free to wrap to two rows */
 #candbar{flex:0 0 auto;margin-bottom:10px}
 #candbar b{display:block;margin-bottom:8px}
@@ -2104,7 +2149,7 @@ button:focus-visible,#home:focus-visible{outline:3px solid var(--ring);outline-o
 .step button{width:48px;height:48px;border-radius:50%;border:1px solid var(--button-border);
  background:var(--button-bg);color:var(--fg);font-size:24px;cursor:pointer;line-height:1}
 .step button:active{background:var(--button-active)}
-#off{min-width:60px;text-align:center;font-variant-numeric:tabular-nums;color:var(--fg)}
+#off,#goff{min-width:60px;text-align:center;font-variant-numeric:tabular-nums;color:var(--fg)}
 .lbl{color:var(--label);font-size:14px}
 /* furigana ruby + per-line translation rendered inside each .ln */
 .ln ruby{ruby-position:over;-webkit-ruby-position:over;ruby-align:center}
@@ -2152,6 +2197,8 @@ let allowLyricRewind=false, lastStateTs=NaN, pollRequestId=0, stateFailures=0;
 let songGeneration=0, lyricRequestId=0, candidateRequestId=0, translationRequestId=0;
 let furigana=[], translations=[], showTrans=false, transLoading=false, transKey="";
 let curTitle="", curArtist="", curSource="auto", curOffset=0;
+// Added to every song on top of its own 微调 (saved on the server, same sign: + = later).
+let globalOffset=0;
 let lyricInfo={source:"—",found:false,lineCount:0,duration:0,title:"",artist:"",album:""};
 let candidates=[], candLoaded=false, candLoading=false, candError=false, candFilter="all";
 const $=id=>document.getElementById(id);
@@ -2374,8 +2421,9 @@ function centerLine(i){
 
 function tick(){
   if(st && lyrics.length){
-    let el = base.elapsed + (base.playing ? performance.now()/1000-base.at : 0) - curOffset;
-    if(st.duration) $("barfill").style.width = (100*Math.min(Math.max(el+curOffset,0),st.duration)/st.duration)+"%";
+    const shift = curOffset + globalOffset;
+    let el = base.elapsed + (base.playing ? performance.now()/1000-base.at : 0) - shift;
+    if(st.duration) $("barfill").style.width = (100*Math.min(Math.max(el+shift,0),st.duration)/st.duration)+"%";
     const canRewind=allowLyricRewind; allowLyricRewind=false;
     const idx=lyricIndexFor(lyrics,el+LEAD,curIdx,canRewind);
     if(idx<0){
@@ -2395,12 +2443,16 @@ function tick(){
 
 function updateCtl(){
   $("off").textContent = (curOffset>0?"+":"") + curOffset.toFixed(1) + "s";
+  if($("goff")) $("goff").textContent = (globalOffset>0?"+":"") + globalOffset.toFixed(1) + "s";
   updateInfo();
 }
 
 function infoSkeleton(){
   if(!$("infopanel") || $("infohead")) return;
-  $("infopanel").innerHTML = `<div id="infohead"></div>`;
+  $("infopanel").innerHTML = `<div id="infohead"></div>`+
+    `<div id="gstep"><div class="row step"><span class="lbl">全局延迟</span>`+
+    `<button id="gm" aria-label="全局提前 0.5 秒">−</button><span id="goff">${(globalOffset>0?"+":"") + globalOffset.toFixed(1)}s</span><button id="gp" aria-label="全局推后 0.5 秒">+</button></div>`+
+    `<div class="hint">所有歌都生效，歌词慢了按 −</div></div>`;
 }
 function srcSkeleton(){
   if(!$("srcpanel") || $("candwrap")) return;
@@ -2462,6 +2514,15 @@ $("srcbtn").onclick=()=>{ const show=$("srcpanel").classList.toggle("show"); if(
 document.addEventListener("click",e=>{ if(!e.target.closest(".info")){ if($("infopanel"))$("infopanel").classList.remove("show"); if($("srcpanel"))$("srcpanel").classList.remove("show"); } });
 $("om").onclick=()=>{ curOffset=Math.max(-10,Math.round((curOffset-STEP)*10)/10); allowLyricRewind=true; updateCtl(); savePrefs(); };
 $("op").onclick=()=>{ curOffset=Math.min(10,Math.round((curOffset+STEP)*10)/10); allowLyricRewind=true; updateCtl(); savePrefs(); };
+function setGlobalOffset(v){
+  globalOffset=Math.max(-5,Math.min(5,Math.round(v*10)/10)); allowLyricRewind=true; updateCtl();
+  fetch("api/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({globalOffset})}).catch(()=>{});
+}
+$("infopanel").onclick=e=>{
+  const b=e.target.closest("button"); if(!b) return;
+  if(b.id==="gm") setGlobalOffset(globalOffset-STEP); else if(b.id==="gp") setGlobalOffset(globalOffset+STEP);
+};
+getJSON("api/settings",{cache:"no-store"}).then(d=>{ if(d && Number.isFinite(+d.globalOffset)){ globalOffset=+d.globalOffset; updateCtl(); } }).catch(()=>{});
 $("trbtn").onclick=()=>{ showTrans=!showTrans; $("trbtn").classList.toggle("on", showTrans);
   if(showTrans && (transKey!==curKey || !translations.length)) loadTranslations(); else renderLines(); };
 
